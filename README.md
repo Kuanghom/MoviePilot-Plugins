@@ -1,13 +1,13 @@
-# MoviePilot-Plugins - Transmission Tracker 标签
+# MoviePilot-Plugins
 
-MoviePilot V2 插件：根据种子 tracker 地址，按配置规则自动为 Transmission 添加标签。
+MoviePilot V2 插件仓库。
 
-## 插件功能
+## 插件列表
 
-- 按 tracker 关键字匹配规则，为 Transmission 种子追加标签
-- 支持多标签：`ourbits.club  我堡/ob/十二大` → 添加 `我堡`、`ob`、`十二大`
-- 支持定时任务、立即运行、远程命令 `/tr_tracker_label`
-- 仅支持 Transmission 下载器
+| 插件 | 说明 |
+|------|------|
+| Transmission Tracker 标签 | 根据 tracker 为 Transmission 种子自动添加标签 |
+| 蜂巢论坛签到 | 自动完成蜂巢论坛每日签到，支持历史记录与 PT 人生数据更新 |
 
 ## 仓库结构
 
@@ -15,7 +15,9 @@ MoviePilot V2 插件：根据种子 tracker 地址，按配置规则自动为 Tr
 .
 ├── package.v2.json
 └── plugins.v2/
-    └── transmissiontrackerlabel/
+    ├── transmissiontrackerlabel/
+    │   └── __init__.py
+    └── fengchaosignin/
         └── __init__.py
 ```
 

@@ -12,5 +12,23 @@
       "v1.0.1": "修复设置页空白：修正下载器列表读取与 Cron 输入组件",
       "v1.0.0": "首个版本：支持 tracker 规则映射、定时任务、远程命令"
     }
+  },
+  "FengchaoSignin": {
+    "name": "蜂巢论坛签到",
+    "description": "自动完成蜂巢论坛每日签到，支持历史记录",
+    "labels": "签到,蜂巢,论坛",
+    "version": "2.1.1",
+    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
+    "author": "madrays",
+    "level": 2,
+    "system_version": ">=2.12.0",
+    "history": {
+      "v2.1.1": "Fix：修复定时签到与手动签到重复注册导致自动签到失败的问题；增强签到任务并发锁。",
+      "v2.1.0": "优化UI界面：移除粉丝、关注框，新增助人、银行数据显示；新增日历视图显示；新增UID显示；其他相关优化。",
+      "v2.0.1": "优化UI界面(有点强迫症)，修复密码输入框无法以密文方式显示的问题。",
+      "v2.0.0": "蜂巢签到更新：若用户没有设置背景页面，则会读取个人页背景封面图；更新个人信息显示效果；恢复徽章显示等。",
+      "v1.0.9": "Fix：修复'FengchaoSignin' object has no attribute 执行失败错误；花粉数量浮点保留一位小数",
+      "v1.0.8": "解除最多50个站点的限制"
+    }
   }
 }
