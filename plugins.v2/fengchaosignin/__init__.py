@@ -20,7 +20,7 @@ from app.utils.http import RequestUtils
 
 class FengchaoSignin(_PluginBase):
     # 插件名称
-    plugin_name = "蜂巢签到"
+    plugin_name = "蜂巢签到(修复版)"
     # 插件描述
     plugin_desc = "蜂巢论坛签到。"
     # 插件图标
@@ -28,7 +28,7 @@ class FengchaoSignin(_PluginBase):
     # 插件版本
     plugin_version = "2.1.1"
     # 插件作者
-    plugin_author = "madrays"
+    plugin_author = "Kuanghom,madrays"
     # 作者主页
     author_url = "https://github.com/madrays"
     # 插件配置项ID前缀
