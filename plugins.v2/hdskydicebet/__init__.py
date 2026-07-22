@@ -25,7 +25,7 @@ class HdskyDiceBet(_PluginBase):
     plugin_name = "空论坛掷骰子下注"
     plugin_desc = "自动参与 HDSky 掷骰子论坛下注，支持固定/随机/智能策略，并汇总魔力盈亏"
     plugin_icon = "https://raw.githubusercontent.com/Kuanghom/MoviePilot-Plugins/main/icons/hdskydicebet.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebet_"
@@ -433,7 +433,7 @@ class HdskyDiceBet(_PluginBase):
         week_pl = self._summarize_pl(history, "week")
         month_pl = self._summarize_pl(history, "month")
         all_pl = self._summarize_pl(history, "all")
-        tickets_today = int(self.get_data("tickets_by_day") or {}).get(today, 0)
+        tickets_today = int((self.get_data("tickets_by_day") or {}).get(today, 0) or 0)
         bets_today = self._count_bets_on(history, today)
         pending_cnt = sum(1 for h in history if h.get("profit") is None)
         win_rate = (
