@@ -27,7 +27,7 @@ class HdskyDiceBet(_PluginBase):
     plugin_name = "空论坛掷骰子下注"
     plugin_desc = "自动参与 HDSky 掷骰子论坛下注；智能模式默认大小，可选按统计显著性加注顺子/豹子"
     plugin_icon = "hdskydicebet.png"
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.10"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebet_"
@@ -50,8 +50,8 @@ class HdskyDiceBet(_PluginBase):
     # 智能主注仅大小（最大猜中率 / 最优 EV）；高赔为可选加注
     SMART_BASE_TYPES = ("大", "小")
     SMART_EXTRA_TYPES = ("顺子", "豹子")
-    # 单侧 z 检验阈值显著偏低的阈值（约 10%）；样本不足不加注
-    SMART_Z_THRESHOLD = -1.28
+    # 单侧 z 偏低阈值（约 15%）；罕见事件另有 k=0 / 半期望 兜底，避免 50 局豹子永远触发不了
+    SMART_Z_THRESHOLD = -1.04
     SMART_EXTRA_MIN_ROUNDS = 20
     TOPIC_TITLE_RE = re.compile(
         r"本轮开奖时间:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
@@ -343,7 +343,7 @@ class HdskyDiceBet(_PluginBase):
                                         "model": "smart_allow_shunzi",
                                         "label": "智能允许加注顺子",
                                         "color": "primary",
-                                        "hint": "仅智能模式：历史显著偏冷时才额外下一注顺子",
+                                        "hint": "仅智能模式：近期偏冷（含长时间未出）时额外下一注顺子",
                                         "persistent-hint": True,
                                     },
                                 }
@@ -359,7 +359,7 @@ class HdskyDiceBet(_PluginBase):
                                         "model": "smart_allow_baozi",
                                         "label": "智能允许加注豹子",
                                         "color": "primary",
-                                        "hint": "仅智能模式：历史显著偏冷时才额外下一注豹子",
+                                        "hint": "仅智能模式：近期偏冷（含长时间未出）时额外下一注豹子",
                                         "persistent-hint": True,
                                     },
                                 }
@@ -375,7 +375,7 @@ class HdskyDiceBet(_PluginBase):
                                         "type": "info",
                                         "variant": "tonal",
                                         "density": "compact",
-                                        "text": "智能主注必为「大」或「小」（猜中率约43%）。勾选高赔后也不会每帖必压，需通过频率 z 检验才加注。",
+                                        "text": "智能主注必为「大」或「小」。勾选顺子/豹子后，样本明显偏冷或长时间未出才会额外加注（不会每帖都压）。",
                                     },
                                 }
                             ],
@@ -1677,35 +1677,49 @@ class HdskyDiceBet(_PluginBase):
     def _smart_choose_base(self, results: List[str]) -> str:
         """
         主注只在「大/小」中选择（两者理论 P、EV 相同）。
-        用样本内相对短缺做并列打破；接近时看连续未出侧。
+        - 只统计大小结果，在最近短窗口内压相对偏少的一侧
+        - 若偏少侧已连续多局未出，改跟最近一次大小（打破「越输越锁死」）
+        - 接近持平时随机，避免平局默认锁「大」
         不声称提高真实胜率，只避免无意义地碰高赔主注。
         """
-        n = len(results) or 1
-        emp = Counter(results)
-        scores = {}
-        for t in self.SMART_BASE_TYPES:
-            p0 = self._p_theo(t)
-            deficit = p0 - emp.get(t, 0) / n
-            streak = self._cold_streak(results, t)
-            # 短缺为主；极弱 streak 仅打破并列
-            scores[t] = deficit + streak * p0 * 0.01
-        best = max(scores, key=scores.get)
-        other = "小" if best == "大" else "大"
-        if abs(scores[best] - scores[other]) < 0.005:
-            best = min(self.SMART_BASE_TYPES, key=lambda x: emp.get(x, 0))
+        size_results = [r for r in results if r in self.SMART_BASE_TYPES]
+        if not size_results:
+            pick = random.choice(list(self.SMART_BASE_TYPES))
+            logger.info(f"{self.LOG_TAG}智能主注={pick} (无大小样本，随机)")
+            return pick
+
+        # 短窗口：旧样本过长会把偏好钉死在一侧
+        window = size_results[: min(20, len(size_results))]
+        emp = Counter(window)
+        c_da, c_xiao = emp.get("大", 0), emp.get("小", 0)
+        diff = c_xiao - c_da  # >0 表示小更多 → 倾向压大
+
+        if abs(diff) <= 1:
+            pick = random.choice(["大", "小"])
+            reason = f"近{len(window)}局接近 大:{c_da}/小:{c_xiao}，随机"
+        else:
+            pick = "大" if diff > 0 else "小"
+            reason = f"近{len(window)}局 大:{c_da}/小:{c_xiao}，压偏少侧"
+
+        # 赌徒谬误死磕：偏少侧冷连越长越该换边，而不是继续加码同一侧
+        cold = self._cold_streak(size_results, pick)
+        if cold >= 3:
+            hot = size_results[0]
+            reason = f"{reason}；{pick}冷连{cold}，改跟热={hot}"
+            pick = hot
+
         logger.info(
-            f"{self.LOG_TAG}智能主注={best} "
-            f"scores={{大:{scores['大']:.4f}, 小:{scores['小']:.4f}}} "
-            f"样本={len(results)} emp_大小={{大:{emp.get('大', 0)}, 小:{emp.get('小', 0)}}}"
+            f"{self.LOG_TAG}智能主注={pick} {reason} "
+            f"样本大小={len(size_results)}/{len(results)}"
         )
-        return best
+        return pick
 
     def _should_add_extra(self, bet_type: str, results: List[str]) -> Tuple[bool, str]:
         """
         是否加注高赔类型：要求
         1) 样本量足够（至少 SMART_EXTRA_MIN_ROUNDS，且建议 >= 1/p0）
-        2) 经验频率相对理论概率显著偏低（单侧 z <= SMART_Z_THRESHOLD）
-        3) 最近连续未出达到约 0.5/p0 局（过滤刚出过又因噪声偏低的情况）
+        2) 偏冷：z 偏低，或样本内 0 次且期望已 >=1.2，或次数不到期望一半
+        3) 最近连续未出达到约 0.35/p0 局（豹子约 13，顺子约 4）
         说明：独立骰子下这不能制造正期望，只是「用户允许高赔时的保守触发器」。
         """
         p0 = self._p_theo(bet_type)
@@ -1714,14 +1728,24 @@ class HdskyDiceBet(_PluginBase):
         if n < min_n:
             return False, f"样本不足 n={n}<{min_n}"
         k = sum(1 for r in results if r == bet_type)
+        expected = n * p0
         z = self._proportion_z(k, n, p0)
         streak = self._cold_streak(results, bet_type)
-        min_streak = max(3, int(math.ceil(0.5 / p0)))
-        if z > self.SMART_Z_THRESHOLD:
-            return False, f"不够冷 z={z:.2f}>{self.SMART_Z_THRESHOLD} (k={k}/{n})"
+        min_streak = max(3, int(math.ceil(0.35 / p0)))
+
+        cold_enough = (
+            z <= self.SMART_Z_THRESHOLD
+            or (k == 0 and expected >= 1.2)
+            or (expected >= 2 and k <= expected * 0.5)
+        )
+        if not cold_enough:
+            return False, (
+                f"不够冷 z={z:.2f} k={k}/{n} E={expected:.1f} "
+                f"(需 z<={self.SMART_Z_THRESHOLD} 或 0次/半期望)"
+            )
         if streak < min_streak:
-            return False, f"冷连不足 streak={streak}<{min_streak} (z={z:.2f})"
-        return True, f"通过 z={z:.2f} streak={streak} k={k}/{n} p0={p0:.4f}"
+            return False, f"冷连不足 streak={streak}<{min_streak} (z={z:.2f} k={k}/{n})"
+        return True, f"通过 z={z:.2f} streak={streak} k={k}/{n} E={expected:.1f}"
 
     def _smart_resolve_plans(self, recent_topics: List[Dict[str, Any]]) -> List[Tuple[str, int]]:
         """
