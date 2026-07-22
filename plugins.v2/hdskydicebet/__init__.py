@@ -11,6 +11,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
+from app.db.site_oper import SiteOper
+from app.helper.sites import SitesHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
@@ -23,7 +25,7 @@ class HdskyDiceBet(_PluginBase):
     plugin_name = "空论坛掷骰子下注"
     plugin_desc = "自动参与 HDSky 掷骰子论坛下注，支持固定/随机/智能策略，并汇总魔力盈亏"
     plugin_icon = "https://raw.githubusercontent.com/Kuanghom/MoviePilot-Plugins/main/icons/hdskydicebet.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.3"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebet_"
@@ -33,6 +35,10 @@ class HdskyDiceBet(_PluginBase):
     LOG_TAG = "[HdskyDiceBet] "
     BASE_URL = "https://hdsky.me"
     FORUM_ID = 71
+    DEFAULT_UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
     BET_TYPES = ("豹子", "顺子", "大", "小")
     # 官方近似赔率（净利润倍数，几乎不抽水）
     ODDS = {"大": 1.29, "小": 1.29, "顺子": 7.8, "豹子": 33.0}
@@ -43,15 +49,23 @@ class HdskyDiceBet(_PluginBase):
         r"本轮开奖时间:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
         r"(?:\s*【\s*(豹子|顺子|大|小)\s+([\d,]+)\s*】)?"
     )
-    BET_BODY_RE = re.compile(r"^(豹子|顺子|大|小)\s+(\d+(?:\.\d+)?[wW]?)\s*$", re.I)
+    BET_BODY_RE = re.compile(
+        r"^(豹子|顺子|大|小)\s+(?:\u00a0|\s)*(\d+(?:\.\d+)?[wW]?)\s*$",
+        re.I,
+    )
     RESULT_IN_TITLE_RE = re.compile(r"【\s*(豹子|顺子|大|小)\s+")
+    # 群聊区同款：按站名白名单过滤（天空）
+    TARGET_SITE_NAMES = ("天空",)
 
     _enabled = False
     _notify = False
     _onlyonce = False
     _cron = "*/3 * * * *"
+    _site_id: Optional[int] = None
     _cookie = ""
+    _ua = DEFAULT_UA
     _use_proxy = True
+    _site_name = ""
     _bet_mode = "smart"  # fixed / random / smart
     _fixed_type = "大"
     _bet_amount = 100
@@ -69,8 +83,7 @@ class HdskyDiceBet(_PluginBase):
         self._notify = bool(config.get("notify"))
         self._onlyonce = bool(config.get("onlyonce"))
         self._cron = (config.get("cron") or "*/3 * * * *").strip()
-        self._cookie = (config.get("cookie") or "").strip()
-        self._use_proxy = bool(config.get("use_proxy", True))
+        self._site_id = self._normalize_site_id(config.get("site_id"))
         self._bet_mode = config.get("bet_mode") or "smart"
         self._fixed_type = config.get("fixed_type") or "大"
         self._bet_amount = self._clamp_amount(config.get("bet_amount", 100))
@@ -79,6 +92,22 @@ class HdskyDiceBet(_PluginBase):
         self._smart_history_rounds = max(10, int(config.get("smart_history_rounds") or 50))
         self._history_days = max(7, int(config.get("history_days") or 90))
         self._username = (self.get_data("username") or "").strip()
+
+        # 未配置时，若站点管理里只有一个天空站，则自动选中
+        if not self._site_id:
+            hdsky_sites = self._list_hdsky_sites()
+            if len(hdsky_sites) == 1:
+                self._site_id = int(hdsky_sites[0].get("id"))
+                config["site_id"] = self._site_id
+                self.update_config(config)
+                logger.info(f"{self.LOG_TAG}自动选中站点: {hdsky_sites[0].get('name')}#{self._site_id}")
+
+        # 过滤已删除站点
+        if self._site_id:
+            valid_ids = {int(s.get("id")) for s in self._list_hdsky_sites() if s.get("id") is not None}
+            if valid_ids and self._site_id not in valid_ids:
+                logger.warning(f"{self.LOG_TAG}已选站点 {self._site_id} 不在可用天空站列表中，请重新选择")
+
 
         self.stop_service()
         if self._onlyonce and self._enabled:
@@ -135,249 +164,255 @@ class HdskyDiceBet(_PluginBase):
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         version = getattr(settings, "VERSION_FLAG", "v1")
         cron_field = "VCronField" if version == "v2" else "VTextField"
-        return [
+        site_options = [
+            {"title": site.get("name"), "value": site.get("id")}
+            for site in self._list_hdsky_sites()
+        ]
+        site_alert = None
+        if not site_options:
+            site_alert = {
+                "component": "VAlert",
+                "props": {
+                    "type": "warning",
+                    "variant": "tonal",
+                    "text": "未在站点管理中找到天空（hdsky.me）。请先添加并配置 Cookie 后再选择。",
+                },
+            }
+        form_content = [
             {
-                "component": "VForm",
+                "component": "VRow",
                 "content": [
                     {
-                        "component": "VRow",
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 4},
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "enabled",
-                                            "label": "启用插件",
-                                            "color": "primary",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "notify",
-                                            "label": "开启通知",
-                                            "color": "info",
-                                            "hint": "下注成功/失败、开奖盈亏会推送到 MoviePilot 消息渠道",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "onlyonce",
-                                            "label": "立即运行一次",
-                                            "color": "warning",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "use_proxy",
-                                            "label": "使用代理",
-                                            "color": "primary",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "cookie",
-                                            "label": "HDSky Cookie",
-                                            "rows": 2,
-                                            "placeholder": "从浏览器复制 hdsky.me 的 Cookie",
-                                            "hint": "需包含 c_secure_uid / c_secure_pass 等登录字段",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": "enabled",
+                                    "label": "启用插件",
+                                    "color": "primary",
+                                },
                             }
                         ],
                     },
                     {
-                        "component": "VRow",
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 4},
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "bet_mode",
-                                            "label": "下注模式",
-                                            "items": [
-                                                {"title": "固定类型", "value": "fixed"},
-                                                {"title": "随机类型", "value": "random"},
-                                                {"title": "智能下注(古典概型)", "value": "smart"},
-                                            ],
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "fixed_type",
-                                            "label": "固定下注类型",
-                                            "items": [
-                                                {"title": t, "value": t} for t in self.BET_TYPES
-                                            ],
-                                            "hint": "仅固定模式生效",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "bet_amount",
-                                            "label": "下注金额",
-                                            "type": "number",
-                                            "hint": "范围 100 ~ 100000",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": "notify",
+                                    "label": "开启通知",
+                                    "color": "info",
+                                    "hint": "下注成功/失败、开奖盈亏会推送到 MoviePilot 消息渠道",
+                                    "persistent-hint": True,
+                                },
+                            }
                         ],
                     },
                     {
-                        "component": "VRow",
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 4},
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": cron_field,
-                                        "props": {
-                                            "model": "cron",
-                                            "label": "执行周期",
-                                            "placeholder": "*/3 * * * *",
-                                            "hint": "建议每 2~5 分钟检查一轮",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "max_daily_bets",
-                                            "label": "每日最大下注次数",
-                                            "placeholder": "不填则不限制",
-                                            "hint": "按自然天统计已成功下注次数",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "max_daily_tickets",
-                                            "label": "每日观影券次数上限",
-                                            "placeholder": "不填则不限制",
-                                            "hint": "评论获得「观影随机续期奖励」按自然天累计，达上限则停止下注",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "smart_history_rounds",
-                                            "label": "智能策略参考历史轮数",
-                                            "type": "number",
-                                            "hint": "默认 50，用于古典概型偏差修正",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "history_days",
-                                            "label": "本地下注记录保留天数",
-                                            "type": "number",
-                                            "placeholder": "90",
-                                        },
-                                    }
-                                ],
-                            },
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": "onlyonce",
+                                    "label": "立即运行一次",
+                                    "color": "warning",
+                                },
+                            }
                         ],
                     },
                 ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VSelect",
+                                "props": {
+                                    "chips": True,
+                                    "model": "site_id",
+                                    "label": "选择站点",
+                                    "items": site_options,
+                                    "hint": "从站点管理读取天空（HDSky）的 Cookie / UA / 代理",
+                                    "persistent-hint": True,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+        if site_alert:
+            form_content.append({"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [site_alert]}]})
+        form_content.extend(
+            [
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "bet_mode",
+                                        "label": "下注模式",
+                                        "items": [
+                                            {"title": "固定类型", "value": "fixed"},
+                                            {"title": "随机类型", "value": "random"},
+                                            {"title": "智能下注(古典概型)", "value": "smart"},
+                                        ],
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "fixed_type",
+                                        "label": "固定下注类型",
+                                        "items": [
+                                            {"title": t, "value": t} for t in self.BET_TYPES
+                                        ],
+                                        "hint": "仅固定模式生效",
+                                        "persistent-hint": True,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "bet_amount",
+                                        "label": "下注金额",
+                                        "type": "number",
+                                        "hint": "范围 100 ~ 100000",
+                                        "persistent-hint": True,
+                                    },
+                                }
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": cron_field,
+                                    "props": {
+                                        "model": "cron",
+                                        "label": "执行周期",
+                                        "placeholder": "*/3 * * * *",
+                                        "hint": "建议每 2~5 分钟检查一轮",
+                                        "persistent-hint": True,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "max_daily_bets",
+                                        "label": "每日最大下注次数",
+                                        "placeholder": "不填则不限制",
+                                        "hint": "按自然天统计已成功下注次数",
+                                        "persistent-hint": True,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "max_daily_tickets",
+                                        "label": "每日观影券次数上限",
+                                        "placeholder": "不填则不限制",
+                                        "hint": "评论获得「观影随机续期奖励」按自然天累计，达上限则停止下注",
+                                        "persistent-hint": True,
+                                    },
+                                }
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "smart_history_rounds",
+                                        "label": "智能策略参考历史轮数",
+                                        "type": "number",
+                                        "hint": "默认 50，用于古典概型偏差修正",
+                                        "persistent-hint": True,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "history_days",
+                                        "label": "本地下注记录保留天数",
+                                        "type": "number",
+                                        "placeholder": "90",
+                                    },
+                                }
+                            ],
+                        },
+                    ],
+                },
+            ]
+        )
+        return [
+            {
+                "component": "VForm",
+                "content": form_content,
             }
         ], {
             "enabled": False,
             "notify": True,
             "onlyonce": False,
-            "use_proxy": True,
-            "cookie": "",
+            "site_id": self._site_id,
             "bet_mode": "smart",
             "fixed_type": "大",
             "bet_amount": 100,
@@ -392,12 +427,21 @@ class HdskyDiceBet(_PluginBase):
         history = self.get_data("history") or []
         last_run = self.get_data("last_run") or {}
         username = self.get_data("username") or self._username or "—"
+        site_name = self.get_data("site_name") or self._site_name or "天空"
         today = self._today_str()
         day_pl = self._summarize_pl(history, "day")
         week_pl = self._summarize_pl(history, "week")
         month_pl = self._summarize_pl(history, "month")
+        all_pl = self._summarize_pl(history, "all")
         tickets_today = int(self.get_data("tickets_by_day") or {}).get(today, 0)
         bets_today = self._count_bets_on(history, today)
+        pending_cnt = sum(1 for h in history if h.get("profit") is None)
+        win_rate = (
+            f"{(all_pl.get('wins', 0) / all_pl.get('settled', 1) * 100):.0f}%"
+            if all_pl.get("settled")
+            else "—"
+        )
+        next_run = self._next_cron_time()
 
         def pl_color(v: float) -> str:
             if v > 0:
@@ -406,16 +450,22 @@ class HdskyDiceBet(_PluginBase):
                 return "error"
             return "secondary"
 
+        mode_map = {"fixed": "固定", "random": "随机", "smart": "智能", "manual": "手动"}
         rows = []
-        for item in sorted(history, key=lambda x: x.get("time", ""), reverse=True)[:80]:
+        for item in sorted(history, key=lambda x: x.get("time", ""), reverse=True)[:100]:
             profit = item.get("profit")
             if profit is None:
-                profit_text = "待结算"
-                profit_color = "warning"
+                status_text, status_color = "待结算", "warning"
+                profit_text = "—"
+            elif int(profit) > 0:
+                status_text, status_color = "盈利", "success"
+                profit_text = f"+{int(profit)}"
+            elif int(profit) < 0:
+                status_text, status_color = "亏损", "error"
+                profit_text = str(int(profit))
             else:
-                profit_text = f"{profit:+d}"
-                profit_color = pl_color(profit)
-            result = item.get("result") or "—"
+                status_text, status_color = "持平", "secondary"
+                profit_text = "0"
             rows.append(
                 {
                     "component": "tr",
@@ -425,31 +475,55 @@ class HdskyDiceBet(_PluginBase):
                             "component": "td",
                             "content": [
                                 {
+                                    "component": "VChip",
+                                    "props": {
+                                        "color": status_color,
+                                        "size": "small",
+                                        "variant": "flat",
+                                    },
+                                    "text": status_text,
+                                }
+                            ],
+                        },
+                        {
+                            "component": "td",
+                            "content": [
+                                {
                                     "component": "a",
                                     "props": {
                                         "href": item.get("url") or "#",
                                         "target": "_blank",
                                     },
-                                    "text": str(item.get("topic_id", "")),
+                                    "text": f"#{item.get('topic_id', '')}",
                                 }
                             ],
                         },
-                        {"component": "td", "text": f"{item.get('bet_type', '')} {item.get('amount', '')}"},
-                        {"component": "td", "text": str(item.get("mode", ""))},
-                        {"component": "td", "text": str(result)},
+                        {
+                            "component": "td",
+                            "text": f"{item.get('bet_type', '')} {item.get('amount', '')}",
+                        },
+                        {
+                            "component": "td",
+                            "text": mode_map.get(str(item.get("mode")), str(item.get("mode") or "—")),
+                        },
+                        {"component": "td", "text": str(item.get("result") or "—")},
                         {
                             "component": "td",
                             "content": [
                                 {
-                                    "component": "VChip",
-                                    "props": {"color": profit_color, "size": "small", "variant": "flat"},
+                                    "component": "span",
+                                    "props": {
+                                        "class": f"text-{status_color}"
+                                        if profit is not None
+                                        else ""
+                                    },
                                     "text": profit_text,
                                 }
                             ],
                         },
                         {
                             "component": "td",
-                            "text": "是" if item.get("got_ticket") else "否",
+                            "text": "🎫" if item.get("got_ticket") else "—",
                         },
                     ],
                 }
@@ -461,48 +535,93 @@ class HdskyDiceBet(_PluginBase):
                 "content": [
                     {
                         "component": "VCol",
-                        "props": {"cols": 12, "md": 3},
+                        "props": {"cols": 12},
                         "content": [
                             {
                                 "component": "VCard",
-                                "props": {"variant": "tonal"},
+                                "props": {"variant": "tonal", "class": "mb-2"},
                                 "content": [
                                     {
                                         "component": "VCardText",
+                                        "props": {"class": "d-flex flex-wrap ga-4"},
                                         "content": [
+                                            {
+                                                "component": "div",
+                                                "text": f"站点：{site_name}",
+                                            },
                                             {"component": "div", "text": f"用户：{username}"},
                                             {
                                                 "component": "div",
-                                                "text": f"今日下注：{bets_today}"
-                                                + (
-                                                    f" / {self._max_daily_bets}"
-                                                    if self._max_daily_bets
-                                                    else ""
-                                                ),
+                                                "text": f"上次执行：{last_run.get('time', '—')}",
                                             },
                                             {
                                                 "component": "div",
-                                                "text": f"今日观影券：{tickets_today}"
-                                                + (
-                                                    f" / {self._max_daily_tickets}"
-                                                    if self._max_daily_tickets
-                                                    else ""
-                                                ),
+                                                "text": f"下次周期：{next_run}",
                                             },
                                             {
                                                 "component": "div",
-                                                "props": {"class": "text-medium-emphasis mt-1"},
-                                                "text": f"上次执行：{last_run.get('time', '—')} | {last_run.get('message', '')}",
+                                                "props": {"class": "text-medium-emphasis"},
+                                                "text": str(last_run.get("message") or ""),
                                             },
                                         ],
                                     }
                                 ],
                             }
                         ],
-                    },
-                    self._summary_card("今日盈亏", day_pl, pl_color(day_pl.get("profit", 0))),
-                    self._summary_card("本周盈亏", week_pl, pl_color(week_pl.get("profit", 0))),
-                    self._summary_card("本月盈亏", month_pl, pl_color(month_pl.get("profit", 0))),
+                    }
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    self._metric_card(
+                        "今日盈亏",
+                        f"{day_pl.get('profit', 0):+d}",
+                        f"已结算 {day_pl.get('settled', 0)} / 下注 {day_pl.get('bets', 0)}",
+                        pl_color(day_pl.get("profit", 0)),
+                        "mdi-calendar-today",
+                    ),
+                    self._metric_card(
+                        "本周盈亏",
+                        f"{week_pl.get('profit', 0):+d}",
+                        f"胜 {week_pl.get('wins', 0)} / 负 {week_pl.get('losses', 0)}",
+                        pl_color(week_pl.get("profit", 0)),
+                        "mdi-calendar-week",
+                    ),
+                    self._metric_card(
+                        "本月盈亏",
+                        f"{month_pl.get('profit', 0):+d}",
+                        f"胜 {month_pl.get('wins', 0)} / 负 {month_pl.get('losses', 0)}",
+                        pl_color(month_pl.get("profit", 0)),
+                        "mdi-calendar-month",
+                    ),
+                    self._metric_card(
+                        "今日下注",
+                        str(bets_today)
+                        + (f" / {self._max_daily_bets}" if self._max_daily_bets else ""),
+                        f"待结算 {pending_cnt} 笔",
+                        "primary",
+                        "mdi-dice-multiple",
+                    ),
+                    self._metric_card(
+                        "累计胜率",
+                        win_rate,
+                        f"胜 {all_pl.get('wins', 0)} / 负 {all_pl.get('losses', 0)}",
+                        "info",
+                        "mdi-chart-line",
+                    ),
+                    self._metric_card(
+                        "今日观影券",
+                        str(tickets_today)
+                        + (
+                            f" / {self._max_daily_tickets}"
+                            if self._max_daily_tickets
+                            else ""
+                        ),
+                        "自然天累计",
+                        "warning",
+                        "mdi-ticket-confirmation",
+                    ),
                 ],
             },
             {
@@ -516,13 +635,27 @@ class HdskyDiceBet(_PluginBase):
                                 "component": "VCard",
                                 "props": {"variant": "outlined"},
                                 "content": [
-                                    {"component": "VCardTitle", "text": "下注记录"},
+                                    {
+                                        "component": "VCardTitle",
+                                        "props": {"class": "d-flex align-center"},
+                                        "content": [
+                                            {
+                                                "component": "VIcon",
+                                                "props": {"class": "mr-2"},
+                                                "text": "mdi-history",
+                                            },
+                                            {"component": "span", "text": "空论坛下注历史"},
+                                        ],
+                                    },
                                     {
                                         "component": "VCardText",
                                         "content": [
                                             {
                                                 "component": "VTable",
-                                                "props": {"hover": True, "density": "compact"},
+                                                "props": {
+                                                    "hover": True,
+                                                    "density": "compact",
+                                                },
                                                 "content": [
                                                     {
                                                         "component": "thead",
@@ -531,6 +664,7 @@ class HdskyDiceBet(_PluginBase):
                                                                 "component": "tr",
                                                                 "content": [
                                                                     {"component": "th", "text": "时间"},
+                                                                    {"component": "th", "text": "状态"},
                                                                     {"component": "th", "text": "帖子"},
                                                                     {"component": "th", "text": "下注"},
                                                                     {"component": "th", "text": "模式"},
@@ -550,7 +684,7 @@ class HdskyDiceBet(_PluginBase):
                                                                 "content": [
                                                                     {
                                                                         "component": "td",
-                                                                        "props": {"colspan": 7},
+                                                                        "props": {"colspan": 8},
                                                                         "text": "暂无下注记录",
                                                                     }
                                                                 ],
@@ -568,6 +702,54 @@ class HdskyDiceBet(_PluginBase):
                 ],
             },
         ]
+
+    @staticmethod
+    def _metric_card(
+        title: str, value: str, subtitle: str, color: str, icon: str
+    ) -> dict:
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "sm": 6, "md": 4, "lg": 2},
+            "content": [
+                {
+                    "component": "VCard",
+                    "props": {"variant": "tonal", "color": color, "class": "mb-2"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "d-flex align-center mb-1"},
+                                    "content": [
+                                        {
+                                            "component": "VIcon",
+                                            "props": {"size": "small", "class": "mr-1"},
+                                            "text": icon,
+                                        },
+                                        {
+                                            "component": "span",
+                                            "props": {"class": "text-caption"},
+                                            "text": title,
+                                        },
+                                    ],
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-h5 font-weight-bold"},
+                                    "text": value,
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption text-medium-emphasis"},
+                                    "text": subtitle,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
 
     @staticmethod
     def _summary_card(title: str, summary: Dict[str, Any], color: str) -> dict:
@@ -696,12 +878,21 @@ class HdskyDiceBet(_PluginBase):
             logger.warning(f"{self.LOG_TAG}上一次任务仍在执行，跳过")
             return
         try:
+            next_run = self._next_cron_time()
+            logger.info(f"{self.LOG_TAG}====== 开始执行 ======")
+            logger.info(f"{self.LOG_TAG}配置: mode={self._bet_mode} amount={self._bet_amount} "
+                        f"site_id={self._site_id} cron={self._cron} 下次周期≈{next_run}")
             message = self._run_internal()
             self.save_data(
                 "last_run",
-                {"time": self._now_str(), "message": message},
+                {
+                    "time": self._now_str(),
+                    "message": message,
+                    "next_run": next_run,
+                },
             )
-            logger.info(f"{self.LOG_TAG}{message}")
+            logger.info(f"{self.LOG_TAG}执行结果: {message}")
+            logger.info(f"{self.LOG_TAG}====== 结束，下次周期≈{next_run} ======")
         except Exception as e:
             logger.error(f"{self.LOG_TAG}执行异常: {e}", exc_info=True)
             self.save_data(
@@ -723,10 +914,12 @@ class HdskyDiceBet(_PluginBase):
             self._run_lock.release()
 
     def _run_internal(self) -> str:
-        if not self._cookie:
-            return "未配置 Cookie"
+        ok, msg = self._load_site_auth()
+        if not ok:
+            return msg
         if not self._ensure_username():
-            return "Cookie 无效或无法识别用户名"
+            return "站点 Cookie 无效或无法识别用户名"
+        logger.info(f"{self.LOG_TAG}当前用户={self._username}")
 
         # 先同步未结算记录与观影券
         self._sync_pending_results()
@@ -736,6 +929,12 @@ class HdskyDiceBet(_PluginBase):
         history = self.get_data("history") or []
         bets_today = self._count_bets_on(history, today)
         tickets_today = int((self.get_data("tickets_by_day") or {}).get(today, 0))
+        logger.info(
+            f"{self.LOG_TAG}今日统计: 下注={bets_today}"
+            f"{'/' + str(self._max_daily_bets) if self._max_daily_bets else ''} "
+            f"观影券={tickets_today}"
+            f"{'/' + str(self._max_daily_tickets) if self._max_daily_tickets else ''}"
+        )
 
         if self._max_daily_bets is not None and bets_today >= self._max_daily_bets:
             return f"已达每日下注上限 {self._max_daily_bets}"
@@ -744,6 +943,15 @@ class HdskyDiceBet(_PluginBase):
 
         topics = self._list_forum_topics(pages=2)
         open_topics = [t for t in topics if t.get("open")]
+        logger.info(
+            f"{self.LOG_TAG}论坛主题: 解析={len(topics)}，可下注={len(open_topics)}，"
+            f"已开奖={sum(1 for t in topics if t.get('result'))}"
+        )
+        for t in topics[:8]:
+            logger.debug(
+                f"{self.LOG_TAG}  topic#{t.get('topic_id')} open={t.get('open')} "
+                f"locked={t.get('locked')} result={t.get('result')} draw={t.get('draw_time')}"
+            )
         if not open_topics:
             return "当前没有可下注帖子"
 
@@ -756,18 +964,25 @@ class HdskyDiceBet(_PluginBase):
             ) >= self._max_daily_bets:
                 break
             if self._already_bet_topic(topic["topic_id"]):
+                logger.debug(f"{self.LOG_TAG}主题#{topic['topic_id']} 本地已有记录，跳过")
                 continue
             # 二次确认帖内是否已下注 / 是否已锁定
             detail = self._fetch_topic_detail(topic["topic_id"])
             if not detail:
                 continue
             if detail.get("locked") or detail.get("result"):
+                logger.debug(f"{self.LOG_TAG}主题#{topic['topic_id']} 已锁定/已开奖，跳过")
                 continue
             if detail.get("self_bet"):
                 self._remember_existing_bet(topic, detail["self_bet"])
+                logger.info(f"{self.LOG_TAG}主题#{topic['topic_id']} 帖内已有自己的下注，记入手动记录")
                 continue
             bet_type = self._choose_bet_type(topics)
             amount = self._clamp_amount(self._bet_amount)
+            logger.info(
+                f"{self.LOG_TAG}准备下注 主题#{topic['topic_id']} => {bet_type} {amount} "
+                f"(开奖 {topic.get('draw_time')})"
+            )
             ok, msg = self._post_bet(topic["topic_id"], bet_type, amount)
             if ok:
                 record = {
@@ -783,6 +998,7 @@ class HdskyDiceBet(_PluginBase):
                     "profit": None,
                     "got_ticket": False,
                     "status": "pending",
+                    "settle_notified": False,
                 }
                 self._append_history(record)
                 acted.append(f"{bet_type} {amount} @#{topic['topic_id']}")
@@ -799,48 +1015,159 @@ class HdskyDiceBet(_PluginBase):
     # ------------------------------------------------------------------ #
     # HTTP / 解析
     # ------------------------------------------------------------------ #
+    def _list_hdsky_sites(self) -> List[Dict[str, Any]]:
+        """对齐群聊区：SitesHelper.get_indexers() + 自定义站，再按天空白名单过滤。"""
+        try:
+            helper = SitesHelper()
+            all_sites = [
+                site for site in (helper.get_indexers() or []) if not site.get("public")
+            ] + self.__custom_sites()
+        except Exception as e:
+            logger.error(f"{self.LOG_TAG}读取站点列表失败: {e}")
+            return []
+        filtered = [site for site in all_sites if self._is_hdsky_indexer(site)]
+        logger.debug(
+            f"{self.LOG_TAG}站点列表: 全部非公开={len(all_sites)}，天空候选={len(filtered)}，"
+            f"名称={[s.get('name') for s in filtered]}"
+        )
+        return filtered
+
+    def __custom_sites(self) -> List[Any]:
+        custom_sites = []
+        try:
+            custom_sites_config = self.get_config("CustomSites")
+            if custom_sites_config and custom_sites_config.get("enabled"):
+                custom_sites = custom_sites_config.get("sites") or []
+        except Exception as e:
+            logger.debug(f"{self.LOG_TAG}读取 CustomSites 失败: {e}")
+        return custom_sites
+
+    @classmethod
+    def _is_hdsky_indexer(cls, site: Dict[str, Any]) -> bool:
+        name = (site.get("name") or "").strip()
+        domain = (site.get("domain") or "").lower()
+        url = (site.get("url") or "").lower()
+        if name in cls.TARGET_SITE_NAMES or "天空" in name:
+            return True
+        return "hdsky" in domain or "hdsky.me" in url
+
+    @staticmethod
+    def _is_hdsky_site(site: Any) -> bool:
+        # 兼容旧 Site 对象判断
+        if isinstance(site, dict):
+            return HdskyDiceBet._is_hdsky_indexer(site)
+        domain = (getattr(site, "domain", None) or "").lower()
+        url = (getattr(site, "url", None) or "").lower()
+        name = getattr(site, "name", None) or ""
+        return (
+            "hdsky" in domain
+            or "hdsky.me" in url
+            or name.strip() == "天空"
+            or "天空" in name
+        )
+
+    @staticmethod
+    def _normalize_site_id(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, list):
+            value = value[0] if value else None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _load_site_auth(self) -> Tuple[bool, str]:
+        """从 SitesHelper indexer 加载天空站 Cookie / UA / 代理 / 地址。"""
+        if not self._site_id:
+            return False, "未选择站点，请在配置中选择天空"
+        sites = self._list_hdsky_sites()
+        site = next((s for s in sites if int(s.get("id")) == int(self._site_id)), None)
+        if not site:
+            # 兜底：直接 SiteOper
+            try:
+                db_site = SiteOper().get(self._site_id)
+            except Exception as e:
+                logger.error(f"{self.LOG_TAG}读取站点失败: {e}")
+                return False, f"读取站点失败: {e}"
+            if not db_site:
+                return False, "站点不存在，请重新选择"
+            site = {
+                "id": db_site.id,
+                "name": db_site.name,
+                "url": db_site.url,
+                "cookie": db_site.cookie,
+                "ua": db_site.ua,
+                "proxy": db_site.proxy,
+                "domain": db_site.domain,
+            }
+        if not self._is_hdsky_indexer(site):
+            return False, f"当前仅支持天空（hdsky.me），已选：{site.get('name')}"
+        cookie = (site.get("cookie") or "").strip()
+        if not cookie:
+            return False, f"站点「{site.get('name')}」未配置 Cookie，请先在站点管理中更新"
+        self._cookie = cookie
+        self._ua = (site.get("ua") or "").strip() or self.DEFAULT_UA
+        self._use_proxy = bool(site.get("proxy"))
+        self._site_name = site.get("name") or "天空"
+        if site.get("url"):
+            self.BASE_URL = str(site.get("url")).rstrip("/")
+        self.save_data("site_name", self._site_name)
+        logger.info(
+            f"{self.LOG_TAG}已加载站点 {self._site_name}#{self._site_id}，"
+            f"代理={'开' if self._use_proxy else '关'}，地址={self.BASE_URL}，"
+            f"Cookie长度={len(self._cookie)}，UA={self._ua[:40]}..."
+        )
+        return True, "ok"
+
     def _proxies(self) -> Optional[dict]:
         if not self._use_proxy:
             return None
         return settings.PROXY
 
+    def _request_headers(self) -> Dict[str, str]:
+        return {
+            "User-Agent": self._ua or self.DEFAULT_UA,
+            "Referer": f"{self.BASE_URL}/forums.php?action=viewforum&forumid={self.FORUM_ID}",
+        }
+
     def _get(self, path: str) -> Optional[str]:
         url = path if path.startswith("http") else urljoin(self.BASE_URL + "/", path.lstrip("/"))
+        headers = self._request_headers()
+        logger.debug(f"{self.LOG_TAG}GET => {url}")
         res = RequestUtils(
             cookies=self._cookie,
             proxies=self._proxies(),
             timeout=30,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": f"{self.BASE_URL}/forums.php?action=viewforum&forumid={self.FORUM_ID}",
-            },
+            headers=headers,
         ).get_res(url=url)
         if not res or res.status_code != 200:
             logger.warning(f"{self.LOG_TAG}GET 失败 {url}: {getattr(res, 'status_code', None)}")
             return None
         text = res.text or ""
+        logger.debug(f"{self.LOG_TAG}GET <= {url} status={res.status_code} bytes={len(text)}")
         if "该页面必须在登录后才能访问" in text or "<title>HDSky :: 登录" in text:
-            logger.error(f"{self.LOG_TAG}Cookie 已失效")
+            logger.error(f"{self.LOG_TAG}站点 Cookie 已失效，请到站点管理更新天空 Cookie")
             return None
         return text
 
     def _post(self, path: str, data: dict) -> Optional[str]:
         url = path if path.startswith("http") else urljoin(self.BASE_URL + "/", path.lstrip("/"))
+        headers = self._request_headers()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        logger.debug(f"{self.LOG_TAG}POST => {url} data_keys={list(data.keys())} body={str(data.get('body'))[:40]}")
         res = RequestUtils(
             cookies=self._cookie,
             proxies=self._proxies(),
             timeout=30,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": f"{self.BASE_URL}/forums.php?action=viewforum&forumid={self.FORUM_ID}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
+            headers=headers,
         ).post_res(url=url, data=data)
         if not res:
+            logger.warning(f"{self.LOG_TAG}POST 无响应 {url}")
             return None
-        return res.text or ""
+        text = res.text or ""
+        logger.debug(f"{self.LOG_TAG}POST <= {url} status={res.status_code} bytes={len(text)}")
+        return text
 
     def _ensure_username(self) -> bool:
         html = self._get(f"/forums.php?action=viewforum&forumid={self.FORUM_ID}")
@@ -918,9 +1245,14 @@ class HdskyDiceBet(_PluginBase):
         title = re.sub(r"\s+", " ", title).strip()
         tm = self.TOPIC_TITLE_RE.search(title)
         result = tm.group(2) if tm else None
+        dice = tm.group(3) if tm else None
         locked = ("锁定" in title) or bool(result) or ("compose" not in first)
         pages = self._topic_page_count(first)
         pages = min(pages, max_pages)
+        logger.debug(
+            f"{self.LOG_TAG}主题#{topic_id} title={title[:60]} result={result} "
+            f"locked={locked} pages={pages} username={self._username}"
+        )
         html_all = first
         for page in range(1, pages):
             more = self._get(
@@ -936,8 +1268,12 @@ class HdskyDiceBet(_PluginBase):
             for post in self._parse_posts(html_all):
                 if post["username"] != self._username:
                     continue
+                logger.debug(
+                    f"{self.LOG_TAG}主题#{topic_id} 找到自己的楼层 pid={post.get('pid')} "
+                    f"bet={post.get('bet_type')} {post.get('amount')} "
+                    f"profit={post.get('settle_profit')} ticket={post.get('got_ticket')}"
+                )
                 if post.get("bet_type"):
-                    # 取该用户在本帖的下注合计盈亏
                     self_bet = {
                         "bet_type": post["bet_type"],
                         "amount": post["amount"],
@@ -951,23 +1287,27 @@ class HdskyDiceBet(_PluginBase):
                     if self_bet:
                         self_bet["profit"] = profit
                         self_bet["got_ticket"] = got_ticket or self_bet.get("got_ticket")
+        else:
+            logger.debug(f"{self.LOG_TAG}主题#{topic_id} 未设置 username，跳过楼层匹配")
 
         return {
             "topic_id": topic_id,
             "title": title,
             "result": result,
+            "dice": dice,
             "locked": locked,
             "self_bet": self_bet,
             "got_ticket": got_ticket,
             "profit": profit,
+            "pages": pages,
         }
 
     @staticmethod
     def _topic_page_count(html: str) -> int:
+        """解析主题分页。HTML 中多为 &amp;page=N，需同时兼容。"""
         pages = {0}
-        for m in re.finditer(r"[?&]page=(\d+)", html):
+        for m in re.finditer(r"(?:[?&]|&amp;)page=(\d+)", html, re.I):
             pages.add(int(m.group(1)))
-        # page 链接是 0-based；最大 page+1 为页数
         return max(pages) + 1
 
     def _parse_posts(self, html: str) -> List[Dict[str, Any]]:
@@ -1160,57 +1500,132 @@ class HdskyDiceBet(_PluginBase):
         history = [h for h in history if (h.get("date") or "") >= cutoff]
         self.save_data("history", history)
 
+    def _calc_settle_profit(
+        self, bet_type: Optional[str], amount: Optional[int], result: Optional[str]
+    ) -> Optional[int]:
+        if not bet_type or not result or amount is None:
+            return None
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            return None
+        if bet_type == result:
+            return int(round(amount * self.ODDS.get(bet_type, 0)))
+        return -amount
+
     def _sync_pending_results(self):
         history = self.get_data("history") or []
         changed = False
         tickets_by_day = dict(self.get_data("tickets_by_day") or {})
         newly_settled: List[Dict[str, Any]] = []
+        pending_items = [
+            item
+            for item in history
+            if not (
+                item.get("status") == "settled"
+                and item.get("profit") is not None
+                and item.get("settle_notified")
+            )
+        ]
+        logger.info(
+            f"{self.LOG_TAG}开始同步未结算记录：history={len(history)}，待处理={len(pending_items)}"
+        )
+
+        # 论坛列表可用于快速拿开奖结果（即使帖内翻页失败也能结算）
+        forum_map = {}
+        try:
+            for t in self._list_forum_topics(pages=2):
+                forum_map[str(t.get("topic_id"))] = t
+            logger.debug(
+                f"{self.LOG_TAG}论坛列表缓存 {len(forum_map)} 条，"
+                f"含结果={sum(1 for v in forum_map.values() if v.get('result'))}"
+            )
+        except Exception as e:
+            logger.warning(f"{self.LOG_TAG}预拉论坛列表失败: {e}")
+
         for item in history:
-            if item.get("status") == "settled" and item.get("profit") is not None:
+            already_settled = (
+                item.get("status") == "settled" and item.get("profit") is not None
+            )
+            if already_settled and item.get("settle_notified"):
                 continue
             topic_id = item.get("topic_id")
             if not topic_id:
                 continue
             was_pending = item.get("profit") is None
-            detail = self._fetch_topic_detail(str(topic_id), max_pages=3)
-            if not detail:
-                continue
-            if detail.get("result"):
-                item["result"] = detail["result"]
-            if detail.get("self_bet") and detail["self_bet"].get("profit") is not None:
-                item["profit"] = detail["self_bet"]["profit"]
-                item["status"] = "settled"
-                changed = True
-            elif detail.get("profit") is not None:
-                item["profit"] = detail["profit"]
-                item["status"] = "settled"
-                changed = True
-            if detail.get("got_ticket") or (
-                detail.get("self_bet") and detail["self_bet"].get("got_ticket")
-            ):
-                if not item.get("got_ticket"):
-                    item["got_ticket"] = True
-                    day = item.get("date") or self._today_str()
-                    tickets_by_day[day] = int(tickets_by_day.get(day, 0)) + 1
-                    changed = True
-            # 标题已开奖但尚未扫到自己评分时，用理论盈亏兜底
-            if detail.get("locked") and detail.get("result") and item.get("profit") is None:
-                if detail.get("self_bet") and detail["self_bet"].get("bet_type"):
-                    bet_type = detail["self_bet"]["bet_type"]
-                    amount = int(detail["self_bet"].get("amount") or item.get("amount") or 0)
-                    result = detail["result"]
-                    if bet_type == result:
-                        item["profit"] = int(round(amount * self.ODDS.get(bet_type, 0)))
-                    else:
-                        item["profit"] = -amount
+            need_notify = already_settled and not item.get("settle_notified")
+
+            detail = self._fetch_topic_detail(str(topic_id), max_pages=5)
+            forum_info = forum_map.get(str(topic_id)) or {}
+            result = None
+            if detail and detail.get("result"):
+                result = detail["result"]
+            elif forum_info.get("result"):
+                result = forum_info["result"]
+                logger.debug(
+                    f"{self.LOG_TAG}主题#{topic_id} 从论坛列表取得开奖结果={result}"
+                )
+
+            if result:
+                item["result"] = result
+
+            if detail:
+                if detail.get("self_bet") and detail["self_bet"].get("profit") is not None:
+                    item["profit"] = detail["self_bet"]["profit"]
                     item["status"] = "settled"
-                    item["result"] = result
                     changed = True
-            if was_pending and item.get("profit") is not None:
-                newly_settled.append(dict(item))
+                    logger.info(
+                        f"{self.LOG_TAG}主题#{topic_id} 兑奖评分结算盈亏={item['profit']}"
+                    )
+                elif detail.get("profit") is not None:
+                    item["profit"] = detail["profit"]
+                    item["status"] = "settled"
+                    changed = True
+                if detail.get("got_ticket") or (
+                    detail.get("self_bet") and detail["self_bet"].get("got_ticket")
+                ):
+                    if not item.get("got_ticket"):
+                        item["got_ticket"] = True
+                        day = item.get("date") or self._today_str()
+                        tickets_by_day[day] = int(tickets_by_day.get(day, 0)) + 1
+                        changed = True
+
+            # 已开奖但评分未刷出 / 翻页未找到楼层：用本地下注记录 + 开奖类型兜底
+            if item.get("profit") is None and result:
+                locked = bool(
+                    (detail and detail.get("locked"))
+                    or forum_info.get("locked")
+                    or result
+                )
+                if locked:
+                    bet_type = None
+                    amount = None
+                    if detail and detail.get("self_bet"):
+                        bet_type = detail["self_bet"].get("bet_type")
+                        amount = detail["self_bet"].get("amount")
+                    bet_type = bet_type or item.get("bet_type")
+                    amount = amount if amount is not None else item.get("amount")
+                    profit = self._calc_settle_profit(bet_type, amount, result)
+                    if profit is not None:
+                        item["profit"] = profit
+                        item["status"] = "settled"
+                        item["result"] = result
+                        changed = True
+                        logger.info(
+                            f"{self.LOG_TAG}主题#{topic_id} 兜底结算：下注={bet_type} {amount} "
+                            f"开奖={result} 盈亏={profit}"
+                        )
+
+            if (was_pending or need_notify) and item.get("profit") is not None:
+                if not item.get("settle_notified"):
+                    newly_settled.append(dict(item))
+                    item["settle_notified"] = True
+                    changed = True
+
         if changed:
             self.save_data("history", history)
             self.save_data("tickets_by_day", tickets_by_day)
+        logger.info(f"{self.LOG_TAG}同步完成，新结算通知 {len(newly_settled)} 条")
         for item in newly_settled:
             self._notify_settlement(item)
 
@@ -1253,8 +1668,10 @@ class HdskyDiceBet(_PluginBase):
             start = today
         elif period == "week":
             start = today - timedelta(days=today.weekday())
-        else:
+        elif period == "month":
             start = today.replace(day=1)
+        else:
+            start = date(1970, 1, 1)
         start_s = start.strftime("%Y-%m-%d")
         bets = 0
         settled = 0
@@ -1322,6 +1739,18 @@ class HdskyDiceBet(_PluginBase):
             return datetime.now(tz) < dt
         except Exception:
             return True
+
+    def _next_cron_time(self) -> str:
+        try:
+            if not self._cron:
+                return "—"
+            tz = pytz.timezone(settings.TZ)
+            trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
+            nxt = trigger.get_next_fire_time(None, datetime.now(tz=tz))
+            return nxt.strftime("%Y-%m-%d %H:%M:%S") if nxt else "—"
+        except Exception as e:
+            logger.debug(f"{self.LOG_TAG}计算下次周期失败: {e}")
+            return "—"
 
     def _now_str(self) -> str:
         return datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
