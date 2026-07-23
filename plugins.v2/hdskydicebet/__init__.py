@@ -6,7 +6,7 @@ import time
 from collections import Counter
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -25,9 +25,9 @@ class HdskyDiceBet(_PluginBase):
     """HDSky 空论坛（掷骰子）自动下注插件。"""
 
     plugin_name = "空论坛掷骰子下注"
-    plugin_desc = "自动参与 HDSky 掷骰子论坛下注；智能模式默认大小，可选按统计显著性加注顺子/豹子"
+    plugin_desc = "自动参与 HDSky 掷骰子论坛下注；轻量历史压大小、倍投、开奖格子与评分短讯归档"
     plugin_icon = "hdskydicebet.png"
-    plugin_version = "1.0.11"
+    plugin_version = "1.0.12"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebet_"
@@ -47,14 +47,18 @@ class HdskyDiceBet(_PluginBase):
     # 三枚骰子古典概型（豹子 > 顺子 > 大小）
     CLASSICAL_COUNT = {"豹子": 6, "顺子": 24, "大": 93, "小": 93}
     CLASSICAL_TOTAL = 216
-    # 智能主注仅大小（最大猜中率 / 最优 EV）；高赔为可选加注
+    # 智能主注仅大小；高赔为可选加注
     SMART_BASE_TYPES = ("大", "小")
     SMART_EXTRA_TYPES = ("顺子", "豹子")
     # 连开大于 2（即 >=3）才强反压
     SMART_REVERSE_STREAK = 3
-    # 单侧 z 偏低阈值（约 15%）；罕见事件另有 k=0 / 半期望 兜底，避免 50 局豹子永远触发不了
+    # 轻量历史近窗长度
+    SMART_LIGHT_WINDOW = 20
+    # 单侧 z 偏低阈值（约 15%）；罕见事件另有 k=0 / 半期望 兜底
     SMART_Z_THRESHOLD = -1.04
     SMART_EXTRA_MIN_ROUNDS = 20
+    RATING_PM_RE = re.compile(r"管理员在您的帖子#\d+评分")
+    RATING_PM_BOX_NAME = "论坛投注"
     TOPIC_TITLE_RE = re.compile(
         r"本轮开奖时间:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
         r"(?:\s*【\s*(豹子|顺子|大|小)\s+([\d,]+)\s*】)?"
@@ -76,7 +80,7 @@ class HdskyDiceBet(_PluginBase):
     _ua = DEFAULT_UA
     _use_proxy = True
     _site_name = ""
-    _bet_mode = "smart"  # fixed / random / smart
+    _bet_mode = "smart"  # fixed / random / smart / martingale
     _fixed_types: List[str] = ["大"]
     _bet_amount = 100
     _amount_by_type: Dict[str, int] = {}
@@ -86,6 +90,8 @@ class HdskyDiceBet(_PluginBase):
     _smart_history_rounds = 50
     _smart_allow_shunzi = False
     _smart_allow_baozi = False
+    _martingale_start_side = "大"
+    _cleanup_rating_pm = True
     _history_days = 90
     _username = ""
     _scheduler: Optional[BackgroundScheduler] = None
@@ -108,6 +114,9 @@ class HdskyDiceBet(_PluginBase):
         self._smart_history_rounds = max(10, int(config.get("smart_history_rounds") or 50))
         self._smart_allow_shunzi = bool(config.get("smart_allow_shunzi"))
         self._smart_allow_baozi = bool(config.get("smart_allow_baozi"))
+        side = (config.get("martingale_start_side") or "大").strip()
+        self._martingale_start_side = side if side in ("大", "小") else "大"
+        self._cleanup_rating_pm = bool(config.get("cleanup_rating_pm", True))
         self._history_days = max(7, int(config.get("history_days") or 90))
         self._username = (self.get_data("username") or "").strip()
 
@@ -288,7 +297,8 @@ class HdskyDiceBet(_PluginBase):
                                         "items": [
                                             {"title": "固定类型(可多选同帖多注)", "value": "fixed"},
                                             {"title": "随机类型", "value": "random"},
-                                            {"title": "智能下注(默认大小+可选高赔)", "value": "smart"},
+                                            {"title": "智能下注(轻量历史压大小)", "value": "smart"},
+                                            {"title": "倍投(固定一侧，开出换边)", "value": "martingale"},
                                         ],
                                     },
                                 }
@@ -377,7 +387,47 @@ class HdskyDiceBet(_PluginBase):
                                         "type": "info",
                                         "variant": "tonal",
                                         "density": "compact",
-                                        "text": "智能主注：连开≥3反压 + 近/中/远历史衰减加权 + 弱转移。勾选顺子/豹子后冷连满间隔即连压。",
+                                        "text": "智能：连开≥3反压，否则压近窗短缺侧。倍投：固定一侧，输×2，开出后换边并回默认金额。",
+                                    },
+                                }
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "martingale_start_side",
+                                        "label": "倍投起始侧",
+                                        "items": [
+                                            {"title": "大", "value": "大"},
+                                            {"title": "小", "value": "小"},
+                                        ],
+                                        "hint": "仅倍投模式：无状态时的起始方向；开出后自动换另一侧",
+                                        "persistent-hint": True,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "cleanup_rating_pm",
+                                        "label": "评分短讯已读并归档",
+                                        "color": "primary",
+                                        "hint": "将「管理员在您的帖子#…评分」标已读并移至「论坛投注」短讯箱（没有则自动创建）",
+                                        "persistent-hint": True,
                                     },
                                 }
                             ],
@@ -533,7 +583,7 @@ class HdskyDiceBet(_PluginBase):
                                         "model": "smart_history_rounds",
                                         "label": "智能策略参考历史轮数",
                                         "type": "number",
-                                        "hint": "默认 50；智能加注顺子/豹子时用于频率 z 检验",
+                                        "hint": "默认 50；智能加注顺子/豹子与开奖格子参考轮数",
                                         "persistent-hint": True,
                                     },
                                 }
@@ -577,6 +627,8 @@ class HdskyDiceBet(_PluginBase):
             "amount_豹子": "",
             "smart_allow_shunzi": False,
             "smart_allow_baozi": False,
+            "martingale_start_side": "大",
+            "cleanup_rating_pm": True,
             "reply_interval": 30,
             "cron": "*/3 * * * *",
             "max_daily_bets": "",
@@ -612,7 +664,13 @@ class HdskyDiceBet(_PluginBase):
                 return "error"
             return "secondary"
 
-        mode_map = {"fixed": "固定", "random": "随机", "smart": "智能", "manual": "手动"}
+        mode_map = {
+            "fixed": "固定",
+            "random": "随机",
+            "smart": "智能",
+            "martingale": "倍投",
+            "manual": "手动",
+        }
         rows = []
         for item in sorted(history, key=lambda x: x.get("time", ""), reverse=True)[:100]:
             profit = item.get("profit")
@@ -691,7 +749,16 @@ class HdskyDiceBet(_PluginBase):
                 }
             )
 
-        return [
+        draw_history = self.get_data("draw_history") or []
+        mg = self.get_data("martingale") or {}
+        mg_text = (
+            f"倍投状态：{mg.get('side') or self._martingale_start_side} "
+            f"{mg.get('amount') or self._bet_amount}"
+            if (self._bet_mode or "").lower() == "martingale" or mg
+            else ""
+        )
+
+        page_blocks = [
             {
                 "component": "VRow",
                 "content": [
@@ -725,6 +792,17 @@ class HdskyDiceBet(_PluginBase):
                                                 "props": {"class": "text-medium-emphasis"},
                                                 "text": str(last_run.get("message") or ""),
                                             },
+                                            *(
+                                                [
+                                                    {
+                                                        "component": "div",
+                                                        "props": {"class": "text-primary"},
+                                                        "text": mg_text,
+                                                    }
+                                                ]
+                                                if mg_text
+                                                else []
+                                            ),
                                         ],
                                     }
                                 ],
@@ -786,6 +864,7 @@ class HdskyDiceBet(_PluginBase):
                     ),
                 ],
             },
+            self._build_draw_history_card(draw_history),
             {
                 "component": "VRow",
                 "content": [
@@ -864,6 +943,206 @@ class HdskyDiceBet(_PluginBase):
                 ],
             },
         ]
+        return page_blocks
+
+    def _build_draw_history_card(self, draw_history: List[dict]) -> dict:
+        """最近 50 局开奖格子（样式对齐蜂巢签到日历）。"""
+        # 存的是新→旧，展示时左→右、上→下为旧→新更易读走势
+        items = list(reversed(draw_history[:50]))
+        cols = 10
+        color_map = {
+            "大": ("rgba(76, 175, 80, 0.18)", "#2E7D32"),
+            "小": ("rgba(33, 150, 243, 0.18)", "#1565C0"),
+            "顺子": ("rgba(255, 152, 0, 0.18)", "#EF6C00"),
+            "豹子": ("rgba(244, 67, 54, 0.18)", "#C62828"),
+        }
+        grid_rows = []
+        if not items:
+            grid_rows.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-medium-emphasis text-caption"},
+                    "text": "暂无开奖缓存，执行一次任务后自动刷新",
+                }
+            )
+        else:
+            for i in range(0, len(items), cols):
+                chunk = items[i : i + cols]
+                cells = []
+                for idx, entry in enumerate(chunk):
+                    result = str(entry.get("result") or "?")
+                    short = {"大": "大", "小": "小", "顺子": "顺", "豹子": "豹"}.get(
+                        result, result[:1]
+                    )
+                    bg, fg = color_map.get(result, ("rgba(158,158,158,0.12)", "#616161"))
+                    seq = i + idx + 1
+                    cells.append(
+                        {
+                            "component": "div",
+                            "props": {
+                                "class": "d-flex justify-center align-center",
+                                "style": f"width: {100 / cols}%;",
+                            },
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "class": "d-flex flex-column justify-center align-center",
+                                        "style": (
+                                            f"width: 36px; height: 36px; border-radius: 6px; "
+                                            f"background-color: {bg}; color: {fg}; margin: 2px;"
+                                        ),
+                                        "title": (
+                                            f"#{entry.get('topic_id', '')} "
+                                            f"{entry.get('draw_time') or ''} {result}"
+                                        ),
+                                    },
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "style": "font-size: 0.6rem; line-height: 1; opacity: 0.65;"
+                                            },
+                                            "text": str(seq),
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": "font-weight-bold",
+                                                "style": "font-size: 0.85rem; line-height: 1.1;",
+                                            },
+                                            "text": short,
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                # 末行补空位对齐
+                while len(cells) < cols:
+                    cells.append(
+                        {
+                            "component": "div",
+                            "props": {"style": f"width: {100 / cols}%; height: 40px;"},
+                        }
+                    )
+                grid_rows.append(
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex justify-space-between mb-1"},
+                        "content": cells,
+                    }
+                )
+
+        legend = {
+            "component": "div",
+            "props": {
+                "class": "d-flex justify-center mt-2 flex-wrap",
+                "style": "font-size: 0.75rem; gap: 10px;",
+            },
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": "width: 8px; height: 8px; border-radius: 50%; "
+                                "background-color: #4CAF50; margin-right: 4px;"
+                            },
+                        },
+                        {"component": "span", "text": "大"},
+                    ],
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": "width: 8px; height: 8px; border-radius: 50%; "
+                                "background-color: #2196F3; margin-right: 4px;"
+                            },
+                        },
+                        {"component": "span", "text": "小"},
+                    ],
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": "width: 8px; height: 8px; border-radius: 50%; "
+                                "background-color: #FF9800; margin-right: 4px;"
+                            },
+                        },
+                        {"component": "span", "text": "顺子"},
+                    ],
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": "width: 8px; height: 8px; border-radius: 50%; "
+                                "background-color: #F44336; margin-right: 4px;"
+                            },
+                        },
+                        {"component": "span", "text": "豹子"},
+                    ],
+                },
+            ],
+        }
+        grid_rows.append(legend)
+
+        return {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12, "md": 6},
+                    "content": [
+                        {
+                            "component": "VCard",
+                            "props": {"variant": "outlined", "class": "mb-2"},
+                            "content": [
+                                {
+                                    "component": "VCardTitle",
+                                    "props": {
+                                        "class": "d-flex align-center justify-center",
+                                        "style": "position: relative;",
+                                    },
+                                    "content": [
+                                        {
+                                            "component": "VIcon",
+                                            "props": {
+                                                "class": "mr-2",
+                                                "style": "position: absolute; left: 16px;",
+                                            },
+                                            "text": "mdi-dice-5",
+                                        },
+                                        {
+                                            "component": "span",
+                                            "text": f"开奖历史（最近 {len(items)} / 50 局）",
+                                        },
+                                    ],
+                                },
+                                {
+                                    "component": "VCardText",
+                                    "content": grid_rows,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
 
     @staticmethod
     def _metric_card(
@@ -965,7 +1244,7 @@ class HdskyDiceBet(_PluginBase):
         day_pl = self._summarize_pl(history, "day")
         bets_today = self._count_bets_on(history, today)
         tickets_today = int((self.get_data("tickets_by_day") or {}).get(today, 0))
-        mode_map = {"fixed": "固定", "random": "随机", "smart": "智能", "manual": "手动"}
+        mode_map = {"fixed": "固定", "random": "随机", "smart": "智能", "martingale": "倍投", "manual": "手动"}
         mode_text = mode_map.get(str(record.get("mode")), str(record.get("mode")))
         limit_bet = f" / {self._max_daily_bets}" if self._max_daily_bets else ""
         limit_ticket = f" / {self._max_daily_tickets}" if self._max_daily_tickets else ""
@@ -1088,6 +1367,8 @@ class HdskyDiceBet(_PluginBase):
                 f"default_amount={self._bet_amount} amounts={self._amount_by_type} "
                 f"interval={self._reply_interval}s "
                 f"smart_extra=顺子:{self._smart_allow_shunzi}/豹子:{self._smart_allow_baozi} "
+                f"martingale_side={self._martingale_start_side} "
+                f"cleanup_pm={self._cleanup_rating_pm} "
                 f"site_id={self._site_id} cron={self._cron} 下次周期≈{next_run}"
             )
             message = self._run_internal()
@@ -1133,6 +1414,14 @@ class HdskyDiceBet(_PluginBase):
         self._sync_pending_results()
         self._refresh_today_tickets()
 
+        if self._cleanup_rating_pm:
+            try:
+                pm_msg = self._cleanup_rating_messages()
+                if pm_msg:
+                    logger.info(f"{self.LOG_TAG}评分短讯处理: {pm_msg}")
+            except Exception as e:
+                logger.warning(f"{self.LOG_TAG}评分短讯处理失败: {e}")
+
         today = self._today_str()
         history = self.get_data("history") or []
         bets_today = self._count_bets_on(history, today)
@@ -1154,6 +1443,7 @@ class HdskyDiceBet(_PluginBase):
             return f"已达每日观影券上限 {self._max_daily_tickets}（今日 {tickets_today}）"
 
         topics = self._list_forum_topics(pages=2)
+        self._refresh_draw_history(topics)
         open_topics = [t for t in topics if t.get("open")]
         logger.info(
             f"{self.LOG_TAG}论坛主题: 解析={len(topics)}，可下注={len(open_topics)}，"
@@ -1166,6 +1456,11 @@ class HdskyDiceBet(_PluginBase):
             )
         if not open_topics:
             return "当前没有可下注帖子"
+
+        # 倍投：有未结算倍投单时不再追新帖，避免同轮多注破坏倍投链
+        mode = (self._bet_mode or "").lower()
+        if mode == "martingale" and self._martingale_has_pending():
+            return "倍投有未结算注单，等待开奖后再下"
 
         # 优先最早开奖的开放帖
         open_topics.sort(key=lambda x: x.get("draw_time") or "")
@@ -1210,8 +1505,8 @@ class HdskyDiceBet(_PluginBase):
             plans = self._resolve_bet_plans(topics)
             local_types = self._bet_types_on_topic(topic["topic_id"])
             done_types = local_types | forum_types
-            # 智能模式同帖只保留一侧主注，避免多次扫描时大/小对冲
-            if (self._bet_mode or "").lower() == "smart" and (
+            # 智能/倍投同帖只保留一侧主注，避免大/小对冲
+            if mode in ("smart", "martingale") and (
                 done_types & set(self.SMART_BASE_TYPES)
             ):
                 plans = [(t, a) for t, a in plans if t not in self.SMART_BASE_TYPES]
@@ -1268,6 +1563,9 @@ class HdskyDiceBet(_PluginBase):
                     self._append_history(record)
                     acted.append(f"{bet_type} {amount} @#{topic['topic_id']}")
                     self._notify_bet_success(record)
+                    # 倍投一轮只下一帖
+                    if mode == "martingale":
+                        break
                 else:
                     acted.append(f"失败#{topic['topic_id']}:{bet_type}:{msg}")
                     logger.warning(
@@ -1277,6 +1575,8 @@ class HdskyDiceBet(_PluginBase):
                     self._notify_bet_failure(topic["topic_id"], f"{bet_type}: {msg}")
                     # 失败则不再继续同帖后续类型，避免间隔后仍撞限制
                     break
+            if mode == "martingale" and acted:
+                break
 
         if not acted:
             return "有开放帖，但均已下注或不可投"
@@ -1421,11 +1721,15 @@ class HdskyDiceBet(_PluginBase):
             return None
         return text
 
-    def _post(self, path: str, data: dict) -> Optional[str]:
+    def _post(self, path: str, data: Any) -> Optional[str]:
         url = path if path.startswith("http") else urljoin(self.BASE_URL + "/", path.lstrip("/"))
         headers = self._request_headers()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-        logger.debug(f"{self.LOG_TAG}POST => {url} data_keys={list(data.keys())} body={str(data.get('body'))[:40]}")
+        if isinstance(data, dict):
+            preview = str(data.get("body") or list(data.keys()))[:80]
+        else:
+            preview = str(data)[:80]
+        logger.debug(f"{self.LOG_TAG}POST => {url} body={preview}")
         res = RequestUtils(
             cookies=self._cookie,
             proxies=self._proxies(),
@@ -1684,39 +1988,65 @@ class HdskyDiceBet(_PluginBase):
         return int(self._amount_by_type.get(bet_type) or self._bet_amount)
 
     def _resolve_bet_plans(self, recent_topics: List[Dict[str, Any]]) -> List[Tuple[str, int]]:
-        """返回本轮要对帖子下注的 (类型, 金额) 列表。固定模式可多注；智能可主注+加注。"""
+        """返回本轮要对帖子下注的 (类型, 金额) 列表。固定模式可多注；智能可主注+加注；倍投单注。"""
         mode = (self._bet_mode or "smart").lower()
         if mode == "fixed":
             return [(t, self._amount_for(t)) for t in self._candidate_types()]
         if mode == "random":
             t = random.choice(self._candidate_types())
             return [(t, self._amount_for(t))]
+        if mode == "martingale":
+            return self._martingale_resolve_plans()
         return self._smart_resolve_plans(recent_topics)
 
     def _choose_bet_type(self, recent_topics: List[Dict[str, Any]]) -> str:
         plans = self._resolve_bet_plans(recent_topics)
         return plans[0][0] if plans else "大"
 
-    def _collect_result_history(self, recent_topics: List[Dict[str, Any]]) -> List[str]:
-        """收集最近 N 轮已开奖结果（论坛列表顺序≈新→旧）。"""
-        result_pairs: List[str] = []
+    def _collect_result_entries(
+        self, recent_topics: List[Dict[str, Any]], limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """收集最近已开奖条目（论坛列表顺序≈新→旧）。"""
+        limit = limit or self._smart_history_rounds
+        entries: List[Dict[str, Any]] = []
         seen_topics = set()
         for t in recent_topics:
             tid, res = t.get("topic_id"), t.get("result")
             if not res or not tid or tid in seen_topics:
                 continue
             seen_topics.add(tid)
-            result_pairs.append(res)
-        if len(result_pairs) < self._smart_history_rounds:
+            entries.append(
+                {
+                    "topic_id": tid,
+                    "result": res,
+                    "draw_time": t.get("draw_time") or "",
+                }
+            )
+        if len(entries) < limit:
             for t in self._list_forum_topics(pages=5):
                 tid, res = t.get("topic_id"), t.get("result")
                 if not res or not tid or tid in seen_topics:
                     continue
                 seen_topics.add(tid)
-                result_pairs.append(res)
-                if len(result_pairs) >= self._smart_history_rounds:
+                entries.append(
+                    {
+                        "topic_id": tid,
+                        "result": res,
+                        "draw_time": t.get("draw_time") or "",
+                    }
+                )
+                if len(entries) >= limit:
                     break
-        return result_pairs[: self._smart_history_rounds]
+        return entries[:limit]
+
+    def _collect_result_history(self, recent_topics: List[Dict[str, Any]]) -> List[str]:
+        """收集最近 N 轮已开奖结果（论坛列表顺序≈新→旧）。"""
+        return [e["result"] for e in self._collect_result_entries(recent_topics)]
+
+    def _refresh_draw_history(self, recent_topics: List[Dict[str, Any]]):
+        entries = self._collect_result_entries(recent_topics, limit=50)
+        if entries:
+            self.save_data("draw_history", entries)
 
     @staticmethod
     def _cold_streak(results: List[str], bet_type: str) -> int:
@@ -1752,12 +2082,9 @@ class HdskyDiceBet(_PluginBase):
 
     def _smart_choose_base(self, results: List[str]) -> str:
         """
-        主注只在「大/小」中选择（两者理论 P、EV 相同）。
-        综合评分：
-        1) 连开 >2（>=3）强反压，连得越长权重越高
-        2) 近/中/远三档历史指数衰减加权：压相对短缺侧（越近权重越大）
-        3) 弱转移：上一把之后历史上更常接出的一侧略加分
-        分数接近则随机。不声称提高真实胜率。
+        轻量历史主注（仅大/小）：
+        1) 连开 ≥3 强制反压
+        2) 否则压近窗（默认 20）相对短缺侧；持平随机
         """
         size_results = [r for r in results if r in self.SMART_BASE_TYPES]
         if not size_results:
@@ -1765,10 +2092,6 @@ class HdskyDiceBet(_PluginBase):
             logger.info(f"{self.LOG_TAG}智能主注={pick} (无大小样本，随机)")
             return pick
 
-        scores = {"大": 0.0, "小": 0.0}
-        parts: List[str] = []
-
-        # 1) 连开反压：必须大于 2
         run_side = size_results[0]
         run_len = 0
         for r in size_results:
@@ -1776,55 +2099,28 @@ class HdskyDiceBet(_PluginBase):
                 break
             run_len += 1
         if run_len >= self.SMART_REVERSE_STREAK:
-            opp = "小" if run_side == "大" else "大"
-            boost = 1.15 + min(run_len - 2, 5) * 0.4
-            scores[opp] += boost
-            parts.append(f"连开{run_side}×{run_len}反压(+{boost:.2f})")
-
-        # 2) 近/中/远历史加权短缺
-        layers = (
-            (size_results[:10], 0.86, 1.35, "近"),
-            (size_results[:24], 0.93, 0.75, "中"),
-            (size_results, 0.97, 0.45, "远"),
-        )
-        for seq, decay, scale, tag in layers:
-            if len(seq) < 4:
-                continue
-            for t in self.SMART_BASE_TYPES:
-                # 相对 50% 短缺 → 加分
-                deficit = 0.5 - self._weighted_freq(seq, t, decay)
-                scores[t] += scale * deficit
-            freq_da = self._weighted_freq(seq, "大", decay)
-            parts.append(f"{tag}衰权大={freq_da:.2f}")
-
-        # 3) 弱一阶转移：上一把之后更常出现的一侧
-        prev = size_results[0]
-        follows = Counter()
-        for i in range(len(size_results) - 1):
-            # newest-first：更旧 size_results[i+1] 之后开出 size_results[i]
-            if size_results[i + 1] == prev:
-                follows[size_results[i]] += 1
-        follow_n = sum(follows.values())
-        if follow_n >= 5:
-            for t in self.SMART_BASE_TYPES:
-                scores[t] += 0.28 * (follows.get(t, 0) / follow_n - 0.5)
-            parts.append(
-                f"转移{prev}→大{follows.get('大', 0)}/小{follows.get('小', 0)}"
+            pick = "小" if run_side == "大" else "大"
+            logger.info(
+                f"{self.LOG_TAG}智能主注={pick} (连开{run_side}×{run_len}反压) "
+                f"样本大小={len(size_results)}/{len(results)}"
             )
+            return pick
 
-        best = max(scores, key=scores.get)
-        other = "小" if best == "大" else "大"
-        if abs(scores[best] - scores[other]) < 0.08:
-            pick = random.choice(["大", "小"])
-            reason = "分差近，随机"
+        window = size_results[: self.SMART_LIGHT_WINDOW]
+        da = sum(1 for r in window if r == "大")
+        xi = sum(1 for r in window if r == "小")
+        if da < xi:
+            pick = "大"
+            reason = f"近{len(window)}短缺大({da}<{xi})"
+        elif xi < da:
+            pick = "小"
+            reason = f"近{len(window)}短缺小({xi}<{da})"
         else:
-            pick = best
-            reason = "综合分高"
+            pick = random.choice(["大", "小"])
+            reason = f"近{len(window)}持平({da}:{xi})，随机"
 
         logger.info(
             f"{self.LOG_TAG}智能主注={pick} ({reason}) "
-            f"scores={{大:{scores['大']:.3f}, 小:{scores['小']:.3f}}} "
-            f"{'; '.join(parts)} "
             f"样本大小={len(size_results)}/{len(results)}"
         )
         return pick
@@ -1892,6 +2188,213 @@ class HdskyDiceBet(_PluginBase):
             f"样本={len(results)} emp={dict(Counter(results))}"
         )
         return plans
+
+    # ------------------------------------------------------------------ #
+    # 倍投
+    # ------------------------------------------------------------------ #
+    def _martingale_has_pending(self) -> bool:
+        history = self.get_data("history") or []
+        return any(
+            (h.get("mode") or "").lower() == "martingale" and h.get("profit") is None
+            for h in history
+        )
+
+    def _martingale_resolve_plans(self) -> List[Tuple[str, int]]:
+        state = dict(self.get_data("martingale") or {})
+        side = state.get("side") or self._martingale_start_side or "大"
+        if side not in self.SMART_BASE_TYPES:
+            side = "大"
+        amount = state.get("amount")
+        if amount is None:
+            amount = self._bet_amount
+        amount = self._clamp_amount(amount)
+        # 持久化，便于详情页展示
+        if state.get("side") != side or state.get("amount") != amount:
+            state.update({"side": side, "amount": amount, "loss_streak": int(state.get("loss_streak") or 0)})
+            self.save_data("martingale", state)
+        logger.info(f"{self.LOG_TAG}倍投计划={side} {amount} streak={state.get('loss_streak', 0)}")
+        return [(side, amount)]
+
+    def _update_martingale_after_settle(self, item: Dict[str, Any]):
+        if (item.get("mode") or "").lower() != "martingale":
+            return
+        state = dict(self.get_data("martingale") or {})
+        side = item.get("bet_type") or state.get("side") or self._martingale_start_side or "大"
+        if side not in self.SMART_BASE_TYPES:
+            side = "大"
+        try:
+            profit = int(item.get("profit"))
+            prev_amount = int(item.get("amount") or self._bet_amount)
+        except (TypeError, ValueError):
+            return
+        if profit > 0:
+            # 开出（猜中）后换另一侧，金额回默认
+            new_side = "小" if side == "大" else "大"
+            new_state = {
+                "side": new_side,
+                "amount": self._bet_amount,
+                "loss_streak": 0,
+            }
+            logger.info(
+                f"{self.LOG_TAG}倍投开出：{side}→换边{new_side}，金额回默认 {self._bet_amount}"
+            )
+        else:
+            doubled = self._clamp_amount(prev_amount * 2)
+            new_state = {
+                "side": side,
+                "amount": doubled,
+                "loss_streak": int(state.get("loss_streak") or 0) + 1,
+            }
+            logger.info(
+                f"{self.LOG_TAG}倍投未中：保持{side}，金额 {prev_amount}→{doubled} "
+                f"streak={new_state['loss_streak']}"
+            )
+        self.save_data("martingale", new_state)
+
+    # ------------------------------------------------------------------ #
+    # 评分短讯：已读 + 移至「论坛投注」
+    # ------------------------------------------------------------------ #
+    def _cleanup_rating_messages(self) -> str:
+        box_no = self._ensure_rating_pm_box()
+        if box_no is None:
+            return "无法确认/创建短讯箱「论坛投注」"
+
+        msg_ids = self._list_inbox_rating_message_ids(max_pages=8)
+        if not msg_ids:
+            return "收件箱无评分短讯"
+
+        marked = self._pm_mark_read(msg_ids)
+        moved = self._pm_move_to_box(msg_ids, box_no)
+        return f"评分短讯 {len(msg_ids)} 条：已读={marked} 移至论坛投注={moved}"
+
+    def _ensure_rating_pm_box(self) -> Optional[int]:
+        boxes = self._parse_pm_boxes()
+        for num, name in boxes.items():
+            if name == self.RATING_PM_BOX_NAME:
+                return num
+        # 没有可创建：走短讯箱管理 add
+        logger.info(f"{self.LOG_TAG}短讯箱无「{self.RATING_PM_BOX_NAME}」，尝试创建")
+        self._get(
+            "/messages.php?action=editmailboxes2&action2=add"
+            f"&new1={quote(self.RATING_PM_BOX_NAME)}"
+        )
+        boxes = self._parse_pm_boxes()
+        for num, name in boxes.items():
+            if name == self.RATING_PM_BOX_NAME:
+                logger.info(f"{self.LOG_TAG}已创建短讯箱「{self.RATING_PM_BOX_NAME}」 box={num}")
+                return num
+        logger.warning(f"{self.LOG_TAG}创建短讯箱「{self.RATING_PM_BOX_NAME}」后仍未找到")
+        return None
+
+    def _parse_pm_boxes(self) -> Dict[int, str]:
+        """从收件箱页解析自定义短讯箱 boxnumber→name。"""
+        html = self._get("/messages.php?action=viewmailbox&box=1")
+        if not html:
+            html = self._get("/messages.php")
+        if not html:
+            return {}
+        boxes: Dict[int, str] = {}
+        for m in re.finditer(
+            r'<option[^>]*value=["\']?(\d+)["\']?[^>]*>([^<]+)</option>',
+            html,
+            re.I,
+        ):
+            num = int(m.group(1))
+            name = re.sub(r"\s+", "", m.group(2)).strip()
+            # 跳过收件箱/发件箱等系统项常见文案
+            if name in ("收件箱", "发件箱", "系统箱", "Inbox", "Sentbox", "请选择", ""):
+                continue
+            if num >= 2:
+                boxes[num] = name
+        return boxes
+
+    def _list_inbox_rating_message_ids(self, max_pages: int = 5) -> List[str]:
+        ids: List[str] = []
+        seen = set()
+        for page in range(max_pages):
+            html = self._get(f"/messages.php?action=viewmailbox&box=1&page={page}")
+            if not html:
+                if page == 0:
+                    html = self._get("/messages.php")
+                if not html:
+                    break
+            page_ids = self._parse_rating_pm_ids(html)
+            if not page_ids and page > 0:
+                break
+            for mid in page_ids:
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                ids.append(mid)
+            # 本页没有更多分页痕迹则停
+            if page > 0 and f"page={page + 1}" not in html and f"page={page+1}" not in html:
+                # 仍可能有评分短讯在后面，但若本页零命中可提前停
+                if not page_ids:
+                    break
+        return ids
+
+    def _parse_rating_pm_ids(self, html: str) -> List[str]:
+        ids: List[str] = []
+        # 主题链接：messages.php?action=viewmessage&id=123
+        for m in re.finditer(
+            r'messages\.php\?action=viewmessage&(?:amp;)?id=(\d+)[^>]*>([^<]*)<',
+            html,
+            re.I,
+        ):
+            mid, subject = m.group(1), m.group(2)
+            subject = re.sub(r"\s+", "", subject)
+            if self.RATING_PM_RE.search(subject):
+                ids.append(mid)
+        if ids:
+            return ids
+        # 兜底：checkbox 与邻近主题文本
+        for m in re.finditer(
+            r'name=["\']messages\[\]["\'][^>]*value=["\']?(\d+)["\']?',
+            html,
+            re.I,
+        ):
+            mid = m.group(1)
+            # 在前后 500 字符窗口找主题
+            start = max(0, m.start() - 500)
+            window = html[start : m.end() + 80]
+            if self.RATING_PM_RE.search(re.sub(r"\s+", "", window)):
+                ids.append(mid)
+        return ids
+
+    def _pm_mark_read(self, message_ids: List[str]) -> int:
+        if not message_ids:
+            return 0
+        ok = 0
+        for i in range(0, len(message_ids), 40):
+            batch = message_ids[i : i + 40]
+            data: List[Tuple[str, str]] = [
+                ("action", "moveordel"),
+                ("markread", "设为已读"),
+            ]
+            for mid in batch:
+                data.append(("messages[]", str(mid)))
+            html = self._post("/messages.php", data)
+            if html is not None:
+                ok += len(batch)
+        return ok
+
+    def _pm_move_to_box(self, message_ids: List[str], box_no: int) -> int:
+        if not message_ids:
+            return 0
+        ok = 0
+        for i in range(0, len(message_ids), 40):
+            batch = message_ids[i : i + 40]
+            data: List[Tuple[str, str]] = [
+                ("action", "moveordel"),
+                ("box", str(box_no)),
+                ("move", "移至"),
+            ]
+            for mid in batch:
+                data.append(("messages[]", str(mid)))
+            html = self._post("/messages.php", data)
+            if html is not None:
+                ok += len(batch)
+        return ok
 
     # ------------------------------------------------------------------ #
     # 记录 / 同步 / 汇总
@@ -2099,6 +2602,7 @@ class HdskyDiceBet(_PluginBase):
             self.save_data("tickets_by_day", tickets_by_day)
         logger.info(f"{self.LOG_TAG}同步完成，新结算通知 {len(newly_settled)} 条")
         for item in newly_settled:
+            self._update_martingale_after_settle(item)
             self._notify_settlement(item)
 
     def _refresh_today_tickets(self):
