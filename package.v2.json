@@ -1,4 +1,17 @@
 {
+  "HdskyDiceBetNatural": {
+    "name": "空论坛掷骰子(拟人)",
+    "description": "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览、金额微抖与短讯解耦",
+    "labels": "HDSky,论坛,下注,拟人",
+    "version": "1.0.0",
+    "icon": "hdskydicebet.png",
+    "author": "Kuanghom",
+    "level": 2,
+    "system_version": ">=2.12.0",
+    "history": {
+      "v1.0.0": "基于空论坛掷骰子复制：默认启用拟人行为（启动抖动、开奖时间窗、进帖停顿、假浏览、跳过、金额微抖、短讯低频归档）"
+    }
+  },
   "HdskyDiceBet": {
     "name": "空论坛掷骰子下注",
     "description": "自动参与 HDSky 掷骰子论坛下注；轻量历史压大小、倍投、开奖格子与评分短讯归档",
