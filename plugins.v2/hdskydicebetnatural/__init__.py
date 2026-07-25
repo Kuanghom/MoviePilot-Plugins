@@ -27,7 +27,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_name = "空论坛掷骰子(拟人)"
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     plugin_icon = "hdskydicebet.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -964,6 +964,8 @@ class HdskyDiceBetNatural(_PluginBase):
         last_run = self.get_data("last_run") or {}
         username = self.get_data("username") or self._username or "—"
         site_name = self.get_data("site_name") or self._site_name or "天空"
+        bonus_text = self._bonus_text()
+        bonus_time = self.get_data("bonus_time") or "—"
         today = self._today_str()
         day_pl = self._summarize_pl(history, "day")
         week_pl = self._summarize_pl(history, "week")
@@ -1103,6 +1105,11 @@ class HdskyDiceBetNatural(_PluginBase):
                                             {"component": "div", "text": f"用户：{username}"},
                                             {
                                                 "component": "div",
+                                                "props": {"class": "text-primary font-weight-medium"},
+                                                "text": f"魔力值：{bonus_text}",
+                                            },
+                                            {
+                                                "component": "div",
                                                 "text": f"上次执行：{last_run.get('time', '—')}",
                                             },
                                             {
@@ -1136,6 +1143,13 @@ class HdskyDiceBetNatural(_PluginBase):
             {
                 "component": "VRow",
                 "content": [
+                    self._metric_card(
+                        "魔力值",
+                        bonus_text,
+                        f"同步于 {bonus_time}",
+                        "deep-purple",
+                        "mdi-star-four-points",
+                    ),
                     self._metric_card(
                         "今日盈亏",
                         f"{day_pl.get('profit', 0):+d}",
@@ -1586,6 +1600,7 @@ class HdskyDiceBetNatural(_PluginBase):
                 f"🧾 下注：{bets_today}{limit_bet} 次\n"
                 f"🎫 观影券：{tickets_today}{limit_ticket}\n"
                 f"💰 今日盈亏：{day_pl.get('profit', 0):+d}\n"
+                f"💫 魔力值：{self._bonus_text()}\n"
                 f"━━━━━━━━━━"
             ),
         )
@@ -1629,6 +1644,7 @@ class HdskyDiceBetNatural(_PluginBase):
                 f"📅 今日盈亏：{day_pl.get('profit', 0):+d}\n"
                 f"🗓️ 本周盈亏：{week_pl.get('profit', 0):+d}\n"
                 f"🎫 观影券：{'是' if item.get('got_ticket') else '否'}\n"
+                f"💫 魔力值：{self._bonus_text()}\n"
                 f"━━━━━━━━━━"
             ),
         )
@@ -1667,6 +1683,7 @@ class HdskyDiceBetNatural(_PluginBase):
                 f"💬 原因：{reason}\n"
                 f"{detail}\n"
                 f"💰 今日盈亏：{day_pl.get('profit', 0):+d}\n"
+                f"💫 魔力值：{self._bonus_text()}\n"
                 f"━━━━━━━━━━\n"
                 f"ℹ️ 明日计数重置后将自动恢复\n"
                 f"━━━━━━━━━━"
@@ -2131,6 +2148,7 @@ class HdskyDiceBetNatural(_PluginBase):
         html = self._get(f"/forums.php?action=viewforum&forumid={self.FORUM_ID}")
         if not html:
             return False
+        self._refresh_bonus_from_html(html)
         m = re.search(
             r"欢迎回来\s*,\s*<span[^>]*>\s*<a[^>]*userdetails\.php\?id=(\d+)[^>]*>\s*<b>([^<]+)</b>",
             html,
@@ -2144,6 +2162,73 @@ class HdskyDiceBetNatural(_PluginBase):
         self.save_data("uid", m.group(1))
         return True
 
+    def _refresh_bonus_from_html(self, html: str):
+        """从空论坛首页（NexusPHP 信息栏）解析并缓存当前魔力值。"""
+        bonus = self._parse_bonus_from_html(html)
+        if bonus is None:
+            return
+        self.save_data("bonus", bonus)
+        self.save_data("bonus_time", self._now_str())
+        logger.debug(f"{self.LOG_TAG}已同步魔力值={self._bonus_text()}")
+
+    @classmethod
+    def _parse_bonus_from_html(cls, html: str) -> Optional[float]:
+        if not html:
+            return None
+        # HDSky 信息栏实测：魔力值：</font>[<a href="mybonus.php">使用</a>]: 733.4
+        m = re.search(
+            r"魔力值.{0,120}?mybonus\.php[^>]*>[^<]*</a>\s*\]?\s*:?\s*([\d,.]+)",
+            html,
+            re.I | re.S,
+        )
+        if m:
+            return cls._to_bonus_float(m.group(1))
+        # 常见：信息栏 mybonus 链接文本即为魔力数字
+        m = re.search(
+            r'<a[^>]+href=["\'][^"\']*mybonus\.php[^"\']*["\'][^>]*>\s*([\d,.]+)\s*</a>',
+            html,
+            re.I,
+        )
+        if m:
+            return cls._to_bonus_float(m.group(1))
+        # 标签「魔力值」邻近数字
+        m = re.search(
+            r"魔力值\s*[\]:：]?\s*(?:<[^>]+>\s*)*([\d,.]+)",
+            html,
+            re.I,
+        )
+        if m:
+            return cls._to_bonus_float(m.group(1))
+        # 兼容 MoviePilot / nas-tools 同类正则
+        m = re.search(
+            r"mybonus.[\[\]:：<>/a-zA-Z_\-=\"'\s#;.(使用魔力值豆]+\s*([\d,.]+)",
+            html,
+            re.I,
+        )
+        if m:
+            return cls._to_bonus_float(m.group(1))
+        return None
+
+    @staticmethod
+    def _to_bonus_float(text: str) -> Optional[float]:
+        try:
+            return float(str(text).replace(",", "").strip().strip('"'))
+        except (TypeError, ValueError):
+            return None
+
+    def _bonus_text(self) -> str:
+        bonus = self.get_data("bonus")
+        if bonus is None:
+            return "—"
+        try:
+            value = float(bonus)
+        except (TypeError, ValueError):
+            return "—"
+        if value == int(value):
+            return f"{int(value):,}"
+        text = f"{value:,.3f}".rstrip("0").rstrip(".")
+        return text or "—"
+
     def _list_forum_topics(self, pages: int = 2) -> List[Dict[str, Any]]:
         topics: List[Dict[str, Any]] = []
         seen = set()
@@ -2153,6 +2238,8 @@ class HdskyDiceBetNatural(_PluginBase):
             )
             if not html:
                 break
+            if page == 0:
+                self._refresh_bonus_from_html(html)
             for topic in self._parse_forum_list(html):
                 if topic["topic_id"] in seen:
                     continue
