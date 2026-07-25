@@ -19,8 +19,9 @@ class TransmissionTrackerLabel(_PluginBase):
 
     plugin_name = "Transmission Tracker 标签"
     plugin_desc = "根据种子 tracker 地址，按配置规则自动为 Transmission 添加标签（支持 / 分隔多标签）"
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/category.png"
-    plugin_version = "1.0.1"
+    # 相对文件名：与官方插件一致，走前端本地 ./plugin_icon/（勿用 raw.githubusercontent.com）
+    plugin_icon = "Transmission_A.png"
+    plugin_version = "1.0.2"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "TransmissionTrackerLabel_"

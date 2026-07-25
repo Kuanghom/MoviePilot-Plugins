@@ -3,12 +3,13 @@
     "name": "空论坛掷骰子(拟人)",
     "description": "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览、金额微抖与短讯解耦",
     "labels": "HDSky,论坛,下注,拟人",
-    "version": "1.0.1",
-    "icon": "hdskydicebet.png",
+    "version": "1.0.2",
+    "icon": "random.png",
     "author": "Kuanghom",
     "level": 2,
     "system_version": ">=2.12.0",
     "history": {
+      "v1.0.2": "图标改为官方相对路径 random.png；魔力低于下注金额时本轮暂停并提醒",
       "v1.0.1": "详情页与消息通知增加当前魔力值展示（从空论坛首页信息栏同步）",
       "v1.0.0": "基于空论坛掷骰子复制：默认启用拟人行为（启动抖动、开奖时间窗、进帖停顿、假浏览、跳过、金额微抖、短讯低频归档）"
     }
@@ -17,12 +18,13 @@
     "name": "空论坛掷骰子下注",
     "description": "自动参与 HDSky 掷骰子论坛下注；轻量历史压大小、倍投、开奖格子与评分短讯归档",
     "labels": "HDSky,论坛,下注",
-    "version": "1.0.13",
-    "icon": "hdskydicebet.png",
+    "version": "1.0.14",
+    "icon": "random.png",
     "author": "Kuanghom",
     "level": 2,
     "system_version": ">=2.12.0",
     "history": {
+      "v1.0.14": "图标改为官方相对路径 random.png；魔力低于下注金额时本轮暂停并提醒",
       "v1.0.13": "详情页与消息通知增加当前魔力值展示（从空论坛首页信息栏同步）",
       "v1.0.12": "智能改轻量历史压大小；新增倍投(开出换边)；详情页50局开奖格子；评分短讯已读并移至论坛投注箱",
       "v1.0.11": "智能主注：连开≥3反压+近中远历史衰减加权+弱转移；顺子/豹子冷连连压；达上限停止通知",
@@ -42,12 +44,13 @@
     "name": "Transmission Tracker 标签",
     "description": "根据种子 tracker 地址，按配置规则自动为 Transmission 添加标签（支持 / 分隔多标签）",
     "labels": "下载管理,Transmission,标签",
-    "version": "1.0.1",
-    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/category.png",
+    "version": "1.0.2",
+    "icon": "Transmission_A.png",
     "author": "Kuanghom",
     "level": 1,
     "system_version": ">=2.12.0",
     "history": {
+      "v1.0.2": "图标改为官方相对路径 Transmission_A.png，修复不显示",
       "v1.0.1": "修复设置页空白：修正下载器列表读取与 Cron 输入组件",
       "v1.0.0": "首个版本：支持 tracker 规则映射、定时任务、远程命令"
     }
@@ -56,12 +59,13 @@
     "name": "蜂巢签到(修复版)",
     "description": "自动完成蜂巢论坛每日签到，支持历史记录",
     "labels": "签到,蜂巢,论坛",
-    "version": "2.1.2",
-    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
+    "version": "2.1.3",
+    "icon": "signin.png",
     "author": "Kuanghom,madrays",
     "level": 2,
     "system_version": ">=2.12.0",
     "history": {
+      "v2.1.3": "图标改为官方相对路径 signin.png，修复不显示",
       "v2.1.2": "变更插件 ID 为 FengchaoSigninFix，避免与原版 FengchaoSignin 冲突。",
       "v2.1.1": "Fix：修复定时签到与手动签到重复注册导致自动签到失败的问题；增强签到任务并发锁。",
       "v2.1.0": "优化UI界面：移除粉丝、关注框，新增助人、银行数据显示；新增日历视图显示；新增UID显示；其他相关优化。",

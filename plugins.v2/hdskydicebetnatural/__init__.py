@@ -26,8 +26,9 @@ class HdskyDiceBetNatural(_PluginBase):
 
     plugin_name = "空论坛掷骰子(拟人)"
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
-    plugin_icon = "hdskydicebet.png"
-    plugin_version = "1.0.1"
+    # 相对文件名：与官方插件一致，走前端本地 ./plugin_icon/
+    plugin_icon = "random.png"
+    plugin_version = "1.0.2"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -1820,6 +1821,13 @@ class HdskyDiceBetNatural(_PluginBase):
         if not open_topics:
             return "当前没有可下注帖子" + ("（或均不在开奖时间窗）" if self._humanize else "")
 
+        # 魔力不足：仅暂停本轮下注，定时任务继续，下轮再判断
+        need_bonus = self._estimate_bet_need()
+        ok_bonus, low_msg = self._bonus_allows_bet(need_bonus)
+        if not ok_bonus:
+            self._notify_bonus_insufficient(self._current_bonus() or 0.0, need_bonus)
+            return low_msg
+
         # 倍投：有未结算倍投单时不再追新帖，避免同轮多注破坏倍投链
         mode = (self._bet_mode or "").lower()
         if mode == "martingale" and self._martingale_has_pending():
@@ -1932,6 +1940,14 @@ class HdskyDiceBetNatural(_PluginBase):
                         f"后继续 {bet_type} {amount}"
                     )
                     time.sleep(wait_s)
+                ok_bonus, low_msg = self._bonus_allows_bet(int(amount))
+                if not ok_bonus:
+                    self._notify_bonus_insufficient(
+                        self._current_bonus() or 0.0, int(amount)
+                    )
+                    if acted:
+                        return "；".join(acted) + f"；{low_msg}"
+                    return low_msg
                 ok, msg = self._post_bet(topic["topic_id"], bet_type, amount)
                 if ok:
                     record = {
@@ -1953,6 +1969,7 @@ class HdskyDiceBetNatural(_PluginBase):
                         "settle_notified": False,
                     }
                     self._append_history(record)
+                    self._consume_bonus(int(amount))
                     acted.append(f"{bet_type} {amount} @#{topic['topic_id']}")
                     self._notify_bet_success(record)
                     # 倍投一轮只下一帖
@@ -2228,6 +2245,86 @@ class HdskyDiceBetNatural(_PluginBase):
             return f"{int(value):,}"
         text = f"{value:,.3f}".rstrip("0").rstrip(".")
         return text or "—"
+
+    def _current_bonus(self) -> Optional[float]:
+        bonus = self.get_data("bonus")
+        if bonus is None:
+            return None
+        try:
+            return float(bonus)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_bonus_value(bonus: float) -> str:
+        if bonus == int(bonus):
+            return f"{int(bonus):,}"
+        return f"{bonus:,.3f}".rstrip("0").rstrip(".")
+
+    def _estimate_bet_need(self) -> int:
+        """估算本轮提前拦截用的单注魔力（倍投取当前档，其它取默认金额）。"""
+        mode = (self._bet_mode or "").lower()
+        if mode == "martingale":
+            mg = self.get_data("martingale") or {}
+            try:
+                return int(mg.get("amount") or self._bet_amount)
+            except (TypeError, ValueError):
+                return int(self._bet_amount)
+        return int(self._bet_amount)
+
+    def _bonus_allows_bet(self, amount: int) -> Tuple[bool, str]:
+        """
+        总魔力低于下注金额则本轮不可下注；魔力足够（>= 金额）才允许。
+        仅暂停当前循环，不终止定时任务。
+        """
+        bonus = self._current_bonus()
+        if bonus is None:
+            return True, ""
+        need = float(amount)
+        if bonus < need:
+            return (
+                False,
+                f"魔力不足({self._format_bonus_value(bonus)} < {amount})，本轮暂停下注",
+            )
+        if self.get_data("bonus_low_notified"):
+            self.save_data("bonus_low_notified", False)
+            logger.info(
+                f"{self.LOG_TAG}魔力已恢复 "
+                f"{self._format_bonus_value(bonus)} >= {amount}，继续下注"
+            )
+        return True, ""
+
+    def _consume_bonus(self, amount: int):
+        bonus = self._current_bonus()
+        if bonus is None:
+            return
+        left = max(0.0, bonus - float(amount))
+        self.save_data("bonus", left)
+
+    def _notify_bonus_insufficient(self, bonus: float, need: int):
+        """魔力不足提醒：连续不足期间只通知一次，避免 cron 刷屏。"""
+        if self.get_data("bonus_low_notified"):
+            return
+        self.save_data("bonus_low_notified", True)
+        self._send_notification(
+            title="【⏸️ 空论坛魔力不足】",
+            text=(
+                f"📢 执行结果\n"
+                f"━━━━━━━━━━\n"
+                f"🕐 时间：{self._now_str()}\n"
+                f"⏸️ 状态：本轮暂停下注\n"
+                f"💬 原因：总魔力低于下注金额\n"
+                f"💫 当前魔力：{self._format_bonus_value(bonus)}\n"
+                f"🎲 需要魔力：{need}\n"
+                f"━━━━━━━━━━\n"
+                f"ℹ️ 仅暂停本轮；任务继续，魔力恢复后自动下注\n"
+                f"━━━━━━━━━━"
+            ),
+        )
+        logger.warning(
+            f"{self.LOG_TAG}魔力不足暂停本轮: "
+            f"{self._format_bonus_value(bonus)} < {need}"
+        )
 
     def _list_forum_topics(self, pages: int = 2) -> List[Dict[str, Any]]:
         topics: List[Dict[str, Any]] = []
