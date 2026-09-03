@@ -23,7 +23,7 @@ class ChdBitsAutoTask(_PluginBase):
     plugin_name = "CHD自动抢任务"
     plugin_desc = "监控 CHDBits 任务名额（剩余/上限），定时轮询并按优先级自动报名"
     plugin_icon = "CHDBits.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "chdbitsautotask_"
@@ -1330,21 +1330,23 @@ class ChdBitsAutoTask(_PluginBase):
             remaining = 0
 
         username = None
+        uid = None
         m_user = re.search(
-            r"欢迎回来\s*,\s*<a[^>]*userdetails\.php\?id=(\d+)[^>]*>\s*([^<]+)\s*</a>",
+            r"欢迎回来[\s\S]{0,200}?userdetails\.php\?id=(\d+)[^>]*>\s*(?:<[^>]+>\s*)*([^<]+)",
             html,
             re.I,
         )
         if not m_user:
+            # 兜底：信息栏用户链接（class 可能带等级名）
             m_user = re.search(
-                r"欢迎回来[\s\S]{0,80}?userdetails\.php\?id=(\d+)[^>]*>\s*([^<]+)",
+                r'<a[^>]*href=["\']userdetails\.php\?id=(\d+)["\'][^>]*>\s*(?:<[^>]+>\s*)*([^<]+)',
                 html,
                 re.I,
             )
-        uid = None
         if m_user:
             uid = m_user.group(1)
             username = re.sub(r"<[^>]+>", "", m_user.group(2)).strip()
+            username = re.sub(r"\s+", " ", username)
 
         bonus = self._parse_number(
             self._match_one(r"魔力值[\s\S]{0,120}?[：:]\s*([\d,\.]+)", html)
