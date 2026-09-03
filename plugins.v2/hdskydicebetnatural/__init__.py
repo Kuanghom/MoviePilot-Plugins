@@ -28,7 +28,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 相对文件名：与官方插件一致，走前端本地 ./plugin_icon/
     plugin_icon = "random.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -88,6 +88,8 @@ class HdskyDiceBetNatural(_PluginBase):
     _reply_interval = 30
     _max_daily_bets: Optional[int] = None
     _max_daily_tickets: Optional[int] = None
+    _stop_profit: Optional[int] = None
+    _stop_loss: Optional[int] = None
     _smart_history_rounds = 50
     _smart_allow_shunzi = False
     _smart_allow_baozi = False
@@ -128,6 +130,8 @@ class HdskyDiceBetNatural(_PluginBase):
         self._reply_interval = self._clamp_interval(config.get("reply_interval", 30))
         self._max_daily_bets = self._to_optional_int(config.get("max_daily_bets"))
         self._max_daily_tickets = self._to_optional_int(config.get("max_daily_tickets"))
+        self._stop_profit = self._to_optional_int(config.get("stop_profit"))
+        self._stop_loss = self._to_optional_int(config.get("stop_loss"))
         self._smart_history_rounds = max(10, int(config.get("smart_history_rounds") or 50))
         self._smart_allow_shunzi = bool(config.get("smart_allow_shunzi"))
         self._smart_allow_baozi = bool(config.get("smart_allow_baozi"))
@@ -638,6 +642,43 @@ class HdskyDiceBetNatural(_PluginBase):
                                 {
                                     "component": "VTextField",
                                     "props": {
+                                        "model": "stop_profit",
+                                        "label": "今日盈利止盈(魔力)",
+                                        "placeholder": "不填则不限制",
+                                        "hint": "今日已结算盈亏 ≥ 该值则停止下注，次日重置",
+                                        "persistent-hint": True,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "stop_loss",
+                                        "label": "今日亏损止损(魔力)",
+                                        "placeholder": "不填则不限制",
+                                        "hint": "今日已结算盈亏 ≤ -该值则停止下注，次日重置",
+                                        "persistent-hint": True,
+                                    },
+                                }
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VTextField",
+                                    "props": {
                                         "model": "smart_history_rounds",
                                         "label": "智能策略参考历史轮数",
                                         "type": "number",
@@ -942,6 +983,8 @@ class HdskyDiceBetNatural(_PluginBase):
             "cron": "*/5 * * * *",
             "max_daily_bets": "",
             "max_daily_tickets": "",
+            "stop_profit": "",
+            "stop_loss": "",
             "smart_history_rounds": 50,
             "history_days": 90,
             "humanize": True,
@@ -1198,6 +1241,23 @@ class HdskyDiceBetNatural(_PluginBase):
                         "自然天累计",
                         "warning",
                         "mdi-ticket-confirmation",
+                    ),
+                    self._metric_card(
+                        "止盈 / 止损",
+                        (
+                            f"+{self._stop_profit}"
+                            if self._stop_profit is not None
+                            else "—"
+                        )
+                        + " / "
+                        + (
+                            f"-{self._stop_loss}"
+                            if self._stop_loss is not None
+                            else "—"
+                        ),
+                        f"今日盈亏 {day_pl.get('profit', 0):+d}",
+                        "secondary",
+                        "mdi-shield-check",
                     ),
                 ],
             },
@@ -1692,6 +1752,65 @@ class HdskyDiceBetNatural(_PluginBase):
         )
         logger.info(f"{self.LOG_TAG}已通知达上限停止 kind={kind} {current}/{limit}")
 
+    def _today_profit(self) -> int:
+        day_pl = self._summarize_pl(self.get_data("history") or [], "day")
+        try:
+            return int(day_pl.get("profit") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _check_pl_stop(self) -> Optional[str]:
+        """今日盈亏触及止盈/止损则停止下注并通知。"""
+        profit = self._today_profit()
+        if self._stop_profit is not None and profit >= self._stop_profit:
+            self._notify_pl_stop("profit", profit, self._stop_profit)
+            return f"已达今日止盈 {self._stop_profit}（当前 {profit:+d}）"
+        if self._stop_loss is not None and profit <= -abs(self._stop_loss):
+            self._notify_pl_stop("loss", profit, self._stop_loss)
+            return f"已达今日止损 {self._stop_loss}（当前 {profit:+d}）"
+        return None
+
+    def _notify_pl_stop(self, kind: str, current: int, limit: int):
+        """
+        因今日止盈/止损停止时通知。
+        kind: profit | loss；同一自然日每种原因只发一次。
+        """
+        today = self._today_str()
+        state = dict(self.get_data("limit_stop_notified") or {})
+        if state.get("date") != today:
+            state = {"date": today}
+        key = f"pl_{kind}"
+        if state.get(key):
+            return
+        state[key] = True
+        self.save_data("limit_stop_notified", state)
+
+        if kind == "profit":
+            reason = "今日盈利已达止盈线"
+            detail = f"🎯 止盈线：+{limit}\n💰 今日盈亏：{current:+d}"
+            title = "【🎯 空论坛止盈停注】"
+        else:
+            reason = "今日亏损已达止损线"
+            detail = f"🛡️ 止损线：-{limit}\n💰 今日盈亏：{current:+d}"
+            title = "【🛡️ 空论坛止损停注】"
+
+        self._send_notification(
+            title=title,
+            text=(
+                f"📢 执行结果\n"
+                f"━━━━━━━━━━\n"
+                f"🕐 时间：{self._now_str()}\n"
+                f"⏸️ 状态：已停止自动下注\n"
+                f"💬 原因：{reason}\n"
+                f"{detail}\n"
+                f"💫 魔力值：{self._bonus_text()}\n"
+                f"━━━━━━━━━━\n"
+                f"ℹ️ 明日盈亏计数重置后将自动恢复\n"
+                f"━━━━━━━━━━"
+            ),
+        )
+        logger.info(f"{self.LOG_TAG}已通知盈亏停注 kind={kind} current={current} limit={limit}")
+
     # ------------------------------------------------------------------ #
     # 主流程
     # ------------------------------------------------------------------ #
@@ -1799,6 +1918,10 @@ class HdskyDiceBetNatural(_PluginBase):
             )
             return f"已达每日观影券上限 {self._max_daily_tickets}（今日 {tickets_today}）"
 
+        pl_stop = self._check_pl_stop()
+        if pl_stop:
+            return pl_stop
+
         topics = self._list_forum_topics(pages=2)
         self._refresh_draw_history(topics)
         open_topics = [t for t in topics if t.get("open")]
@@ -1862,6 +1985,8 @@ class HdskyDiceBetNatural(_PluginBase):
                         "tickets", tickets_now, self._max_daily_tickets
                     )
                     break
+            if self._check_pl_stop():
+                break
 
             if self._humanize and self._skip_bet_prob > 0 and random.random() < self._skip_bet_prob:
                 logger.info(
@@ -1932,6 +2057,9 @@ class HdskyDiceBetNatural(_PluginBase):
                         self._max_daily_bets,
                     )
                     acted.append(f"达每日上限，停止后续多注@#{topic['topic_id']}")
+                    break
+                if self._check_pl_stop():
+                    acted.append(f"达盈亏止损/止盈，停止后续多注@#{topic['topic_id']}")
                     break
                 if idx > 0 and self._reply_interval > 0:
                     wait_s = self._jittered_reply_interval()
