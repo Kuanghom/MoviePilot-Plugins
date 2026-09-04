@@ -23,7 +23,7 @@ class ChdBitsAutoTask(_PluginBase):
     plugin_name = "CHD自动抢任务"
     plugin_desc = "监控 CHDBits 任务名额（剩余/上限），定时轮询并按优先级自动报名"
     plugin_icon = "CHDBits.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "chdbitsautotask_"
@@ -515,33 +515,73 @@ class ChdBitsAutoTask(_PluginBase):
             "close": "error",
             "unknown": "secondary",
         }.get(state, "secondary")
+        state_icon = {
+            "idle": "mdi-check-circle",
+            "excess": "mdi-account-group",
+            "tasking": "mdi-progress-clock",
+            "close": "mdi-close-circle",
+            "unknown": "mdi-help-circle",
+        }.get(state, "mdi-help-circle")
 
-        cards = [
-            self._stat_card("站点", site_name, "primary"),
-            self._stat_card("用户", username, "secondary"),
-            self._stat_card(
-                "剩余 / 上限",
-                f"{remaining if remaining is not None else '—'} / {limit if limit is not None else '—'}",
-                rem_color,
-            ),
-            self._stat_card("当前占用", str(current if current is not None else "—"), "info"),
-            self._stat_card("状态", state_text, state_color),
-            self._stat_card(
-                "魔力",
-                f"{bonus:,.1f}" if isinstance(bonus, (int, float)) else "—",
-                "warning",
-            ),
-            self._stat_card(
-                "做种积分",
-                f"{seed_points:,.1f}" if isinstance(seed_points, (int, float)) else "—",
-                "success",
-            ),
-            self._stat_card(
-                "任务进度",
-                progress.get("overall_text") or ("进行中" if state == "tasking" else "—"),
-                "info" if state == "tasking" else "secondary",
-            ),
+        overall_pct = progress.get("overall_pct")
+        if isinstance(overall_pct, (int, float)):
+            overall_display = f"{overall_pct:.1f}%"
+            overall_sub = progress.get("task_label") or "整体完成度"
+        elif state == "tasking":
+            overall_display = "进行中"
+            overall_sub = progress.get("task_label") or "暂无百分比"
+        else:
+            overall_display = "—"
+            overall_sub = "暂无进行中任务"
+
+        page = [
+            {
+                "component": "VRow",
+                "content": [
+                    self._metric_card("站点", site_name, "CHDBits 任务站", "primary", "mdi-web"),
+                    self._metric_card("用户", username, "当前账号", "secondary", "mdi-account"),
+                    self._metric_card(
+                        "剩余 / 上限",
+                        f"{remaining if remaining is not None else '—'} / {limit if limit is not None else '—'}",
+                        "名额占用情况",
+                        rem_color,
+                        "mdi-ticket-confirmation",
+                    ),
+                    self._metric_card(
+                        "当前占用",
+                        str(current if current is not None else "—"),
+                        "已占用名额",
+                        "info",
+                        "mdi-account-multiple",
+                    ),
+                    self._metric_card("状态", state_text, "系统状态", state_color, state_icon),
+                    self._metric_card(
+                        "魔力",
+                        f"{bonus:,.1f}" if isinstance(bonus, (int, float)) else "—",
+                        "账户余额",
+                        "warning",
+                        "mdi-star-four-points",
+                    ),
+                    self._metric_card(
+                        "做种积分",
+                        f"{seed_points:,.1f}" if isinstance(seed_points, (int, float)) else "—",
+                        "账户做种积分",
+                        "success",
+                        "mdi-seed",
+                    ),
+                    self._metric_card(
+                        "任务进度",
+                        overall_display,
+                        overall_sub,
+                        "info" if state == "tasking" else "secondary",
+                        "mdi-chart-timeline-variant",
+                    ),
+                ],
+            },
         ]
+
+        if state == "tasking" or progress:
+            page.append(self._build_progress_panel(progress, updated, state))
 
         task_rows = []
         for t in tasks:
@@ -581,6 +621,7 @@ class ChdBitsAutoTask(_PluginBase):
                                         "color": "success" if ok else "error",
                                         "size": "small",
                                         "variant": "flat",
+                                        "prepend-icon": "mdi-check" if ok else "mdi-close",
                                     },
                                     "text": "成功" if ok else "失败",
                                 }
@@ -597,221 +638,631 @@ class ChdBitsAutoTask(_PluginBase):
                 }
             )
 
-        progress_alert = None
-        if state == "tasking" or progress:
-            prog_lines = [
-                f"任务：{progress.get('task_label') or '进行中'}",
-                f"整体：{progress.get('overall_text') or '—'}",
-            ]
-            for key, label in (("upload", "上传"), ("download", "下载"), ("seed", "做种积分")):
-                item = progress.get(key) or {}
-                if item.get("text"):
-                    prog_lines.append(f"{label}：{item['text']}")
-            if progress.get("remain_text"):
-                prog_lines.append(f"剩余时间：{progress.get('remain_text')}")
-            prog_lines.append(f"更新：{updated}")
-            progress_alert = {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "success",
-                                    "variant": "tonal",
-                                    "text": " | ".join(prog_lines),
-                                },
-                            }
-                        ],
-                    }
-                ],
-            }
-
-        page = [
-            {
-                "component": "VRow",
-                "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [c]}
-                    for c in cards
-                ],
-            },
-        ]
-        if progress_alert:
-            page.append(progress_alert)
         page.extend(
             [
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "variant": "tonal",
-                                    "text": (
-                                        f"自动报名={'开' if self._auto_claim else '关'}；"
-                                        f"达成后停用={'开' if self._stop_on_hit else '关'}；"
-                                        f"进度通知={'开' if self._progress_notify else '关'}"
-                                        f"（每{self._progress_interval_hours}小时）；"
-                                        f"优先级：{preferred}；"
-                                        f"Cron：{self._cron or '—'}；"
-                                        f"最低保留魔力：{self._min_bonus}"
-                                    ),
-                                },
-                            }
-                        ],
-                    }
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VCard",
-                                "props": {"variant": "tonal"},
-                                "content": [
-                                    {
-                                        "component": "VCardTitle",
-                                        "text": "任务档位（页面解析）",
-                                    },
-                                    {
-                                        "component": "VCardText",
-                                        "content": [
-                                            {
-                                                "component": "VTable",
-                                                "props": {"density": "compact"},
-                                                "content": [
-                                                    {
-                                                        "component": "thead",
-                                                        "content": [
-                                                            {
-                                                                "component": "tr",
-                                                                "content": [
-                                                                    {"component": "th", "text": "任务"},
-                                                                    {"component": "th", "text": "别名"},
-                                                                    {"component": "th", "text": "上传"},
-                                                                    {"component": "th", "text": "下载"},
-                                                                    {"component": "th", "text": "做种积分"},
-                                                                    {"component": "th", "text": "报名费"},
-                                                                    {"component": "th", "text": "奖励"},
-                                                                    {"component": "th", "text": "我已完成"},
-                                                                ],
-                                                            }
-                                                        ],
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {
+                                    "component": "VCard",
+                                    "props": {"variant": "tonal", "class": "mb-2"},
+                                    "content": [
+                                        {
+                                            "component": "VCardText",
+                                            "props": {
+                                                "class": "d-flex flex-wrap align-center ga-2"
+                                            },
+                                            "content": [
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {
+                                                        "size": "small",
+                                                        "color": "success"
+                                                        if self._auto_claim
+                                                        else "secondary",
+                                                        "variant": "flat",
+                                                        "prepend-icon": "mdi-rocket-launch",
                                                     },
-                                                    {
-                                                        "component": "tbody",
-                                                        "content": task_rows
-                                                        or [
-                                                            {
-                                                                "component": "tr",
-                                                                "content": [
-                                                                    {
-                                                                        "component": "td",
-                                                                        "props": {"colspan": 8},
-                                                                        "text": "暂无数据，请先运行一次",
-                                                                    }
-                                                                ],
-                                                            }
-                                                        ],
+                                                    "text": f"自动报名{'开' if self._auto_claim else '关'}",
+                                                },
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {
+                                                        "size": "small",
+                                                        "color": "warning"
+                                                        if self._stop_on_hit
+                                                        else "secondary",
+                                                        "variant": "flat",
+                                                        "prepend-icon": "mdi-pause-circle",
                                                     },
-                                                ],
-                                            }
-                                        ],
-                                    },
-                                ],
-                            }
-                        ],
-                    }
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VCard",
-                                "props": {"variant": "tonal"},
-                                "content": [
-                                    {
-                                        "component": "VCardTitle",
-                                        "text": "报名记录",
-                                    },
-                                    {
-                                        "component": "VCardText",
-                                        "content": [
-                                            {
-                                                "component": "VTable",
-                                                "props": {"density": "compact"},
-                                                "content": [
-                                                    {
-                                                        "component": "thead",
-                                                        "content": [
-                                                            {
-                                                                "component": "tr",
-                                                                "content": [
-                                                                    {"component": "th", "text": "时间"},
-                                                                    {"component": "th", "text": "结果"},
-                                                                    {"component": "th", "text": "任务"},
-                                                                    {"component": "th", "text": "报名费"},
-                                                                    {"component": "th", "text": "剩余/上限"},
-                                                                    {"component": "th", "text": "说明"},
-                                                                ],
-                                                            }
-                                                        ],
+                                                    "text": f"达成后停用{'开' if self._stop_on_hit else '关'}",
+                                                },
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {
+                                                        "size": "small",
+                                                        "color": "info"
+                                                        if self._progress_notify
+                                                        else "secondary",
+                                                        "variant": "flat",
+                                                        "prepend-icon": "mdi-bell-ring",
                                                     },
-                                                    {
-                                                        "component": "tbody",
-                                                        "content": hist_rows
-                                                        or [
-                                                            {
-                                                                "component": "tr",
-                                                                "content": [
-                                                                    {
-                                                                        "component": "td",
-                                                                        "props": {"colspan": 6},
-                                                                        "text": "暂无报名记录",
-                                                                    }
-                                                                ],
-                                                            }
-                                                        ],
+                                                    "text": (
+                                                        f"进度通知{'开' if self._progress_notify else '关'}"
+                                                        f"（每{self._progress_interval_hours}小时）"
+                                                    ),
+                                                },
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {
+                                                        "size": "small",
+                                                        "color": "primary",
+                                                        "variant": "tonal",
+                                                        "prepend-icon": "mdi-sort-ascending",
                                                     },
-                                                ],
-                                            }
-                                        ],
-                                    },
-                                ],
-                            }
-                        ],
-                    }
-                ],
-            },
-        ]
+                                                    "text": f"优先级：{preferred}",
+                                                },
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {
+                                                        "size": "small",
+                                                        "color": "secondary",
+                                                        "variant": "tonal",
+                                                        "prepend-icon": "mdi-clock-outline",
+                                                    },
+                                                    "text": f"Cron：{self._cron or '—'}",
+                                                },
+                                                {
+                                                    "component": "VChip",
+                                                    "props": {
+                                                        "size": "small",
+                                                        "color": "amber-darken-2",
+                                                        "variant": "tonal",
+                                                        "prepend-icon": "mdi-shield-half-full",
+                                                    },
+                                                    "text": f"最低保留魔力：{self._min_bonus}",
+                                                },
+                                            ],
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {
+                                    "component": "VCard",
+                                    "props": {"variant": "outlined", "class": "mb-2"},
+                                    "content": [
+                                        {
+                                            "component": "VCardTitle",
+                                            "props": {"class": "d-flex align-center"},
+                                            "content": [
+                                                {
+                                                    "component": "VIcon",
+                                                    "props": {
+                                                        "color": "primary",
+                                                        "class": "mr-2",
+                                                    },
+                                                    "text": "mdi-trophy-variant",
+                                                },
+                                                {
+                                                    "component": "span",
+                                                    "text": "任务档位（页面解析）",
+                                                },
+                                            ],
+                                        },
+                                        {"component": "VDivider"},
+                                        {
+                                            "component": "VCardText",
+                                            "content": [
+                                                {
+                                                    "component": "VTable",
+                                                    "props": {
+                                                        "density": "compact",
+                                                        "hover": True,
+                                                    },
+                                                    "content": [
+                                                        {
+                                                            "component": "thead",
+                                                            "content": [
+                                                                {
+                                                                    "component": "tr",
+                                                                    "content": [
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "任务",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "别名",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "上传",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "下载",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "做种积分",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "报名费",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "奖励",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "我已完成",
+                                                                        },
+                                                                    ],
+                                                                }
+                                                            ],
+                                                        },
+                                                        {
+                                                            "component": "tbody",
+                                                            "content": task_rows
+                                                            or [
+                                                                {
+                                                                    "component": "tr",
+                                                                    "content": [
+                                                                        {
+                                                                            "component": "td",
+                                                                            "props": {
+                                                                                "colspan": 8
+                                                                            },
+                                                                            "text": "暂无数据，请先运行一次",
+                                                                        }
+                                                                    ],
+                                                                }
+                                                            ],
+                                                        },
+                                                    ],
+                                                }
+                                            ],
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {
+                                    "component": "VCard",
+                                    "props": {"variant": "outlined", "class": "mb-2"},
+                                    "content": [
+                                        {
+                                            "component": "VCardTitle",
+                                            "props": {"class": "d-flex align-center"},
+                                            "content": [
+                                                {
+                                                    "component": "VIcon",
+                                                    "props": {
+                                                        "color": "deep-purple",
+                                                        "class": "mr-2",
+                                                    },
+                                                    "text": "mdi-history",
+                                                },
+                                                {
+                                                    "component": "span",
+                                                    "text": "报名记录",
+                                                },
+                                            ],
+                                        },
+                                        {"component": "VDivider"},
+                                        {
+                                            "component": "VCardText",
+                                            "content": [
+                                                {
+                                                    "component": "VTable",
+                                                    "props": {
+                                                        "density": "compact",
+                                                        "hover": True,
+                                                    },
+                                                    "content": [
+                                                        {
+                                                            "component": "thead",
+                                                            "content": [
+                                                                {
+                                                                    "component": "tr",
+                                                                    "content": [
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "时间",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "结果",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "任务",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "报名费",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "剩余/上限",
+                                                                        },
+                                                                        {
+                                                                            "component": "th",
+                                                                            "text": "说明",
+                                                                        },
+                                                                    ],
+                                                                }
+                                                            ],
+                                                        },
+                                                        {
+                                                            "component": "tbody",
+                                                            "content": hist_rows
+                                                            or [
+                                                                {
+                                                                    "component": "tr",
+                                                                    "content": [
+                                                                        {
+                                                                            "component": "td",
+                                                                            "props": {
+                                                                                "colspan": 6
+                                                                            },
+                                                                            "text": "暂无报名记录",
+                                                                        }
+                                                                    ],
+                                                                }
+                                                            ],
+                                                        },
+                                                    ],
+                                                }
+                                            ],
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ]
         )
         return page
 
     @staticmethod
-    def _stat_card(title: str, text: str, color: str) -> dict:
+    def _metric_card(
+        title: str, value: str, subtitle: str, color: str, icon: str
+    ) -> dict:
         return {
-            "component": "VCard",
-            "props": {"variant": "tonal", "color": color},
+            "component": "VCol",
+            "props": {"cols": 12, "sm": 6, "md": 3},
             "content": [
-                {"component": "VCardTitle", "props": {"class": "text-subtitle-2"}, "text": title},
-                {"component": "VCardText", "props": {"class": "text-h6"}, "text": text},
+                {
+                    "component": "VCard",
+                    "props": {"variant": "tonal", "color": color, "class": "mb-2"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "d-flex align-center mb-1"},
+                                    "content": [
+                                        {
+                                            "component": "VIcon",
+                                            "props": {"size": "small", "class": "mr-1"},
+                                            "text": icon,
+                                        },
+                                        {
+                                            "component": "span",
+                                            "props": {"class": "text-caption"},
+                                            "text": title,
+                                        },
+                                    ],
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-h6 font-weight-bold"},
+                                    "text": value,
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "class": "text-caption text-medium-emphasis"
+                                    },
+                                    "text": subtitle,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def _build_progress_panel(
+        self, progress: Dict[str, Any], updated: str, state: str
+    ) -> dict:
+        """任务进度面板：真实进度条 + 指标图标。"""
+        overall_pct = progress.get("overall_pct")
+        overall_val = (
+            float(overall_pct)
+            if isinstance(overall_pct, (int, float))
+            else 0.0
+        )
+        done = bool(progress.get("completed"))
+        header_chips = [
+            {
+                "component": "VChip",
+                "props": {
+                    "size": "small",
+                    "color": "success" if done else ("info" if state == "tasking" else "secondary"),
+                    "variant": "flat",
+                    "prepend-icon": "mdi-check-decagram"
+                    if done
+                    else "mdi-progress-wrench",
+                    "class": "mr-2",
+                },
+                "text": progress.get("task_label") or "进行中",
+            }
+        ]
+        if progress.get("remain_text"):
+            header_chips.append(
+                {
+                    "component": "VChip",
+                    "props": {
+                        "size": "small",
+                        "color": "warning",
+                        "variant": "tonal",
+                        "prepend-icon": "mdi-timer-sand",
+                        "class": "mr-2",
+                    },
+                    "text": f"剩余 {progress.get('remain_text')}",
+                }
+            )
+
+        metric_defs = (
+            ("upload", "上传量", "mdi-cloud-upload", "teal", "G"),
+            ("download", "下载量", "mdi-cloud-download", "indigo", "G"),
+            ("seed", "做种积分", "mdi-seed-outline", "orange", ""),
+        )
+        metric_cols = []
+        for key, label, icon, color, unit in metric_defs:
+            item = progress.get(key) or {}
+            metric_cols.append(
+                self._progress_metric_col(label, icon, color, item, unit)
+            )
+
+        return {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {
+                            "component": "VCard",
+                            "props": {"variant": "outlined", "class": "mb-2"},
+                            "content": [
+                                {
+                                    "component": "VCardTitle",
+                                    "props": {
+                                        "class": "d-flex align-center flex-wrap"
+                                    },
+                                    "content": [
+                                        {
+                                            "component": "VIcon",
+                                            "props": {
+                                                "color": "success",
+                                                "class": "mr-2",
+                                            },
+                                            "text": "mdi-chart-bar",
+                                        },
+                                        {
+                                            "component": "span",
+                                            "props": {"class": "mr-3"},
+                                            "text": "当前任务进度",
+                                        },
+                                        *header_chips,
+                                        {"component": "VSpacer"},
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": "d-flex align-center text-caption text-medium-emphasis"
+                                            },
+                                            "content": [
+                                                {
+                                                    "component": "VIcon",
+                                                    "props": {
+                                                        "size": "x-small",
+                                                        "class": "mr-1",
+                                                    },
+                                                    "text": "mdi-update",
+                                                },
+                                                {
+                                                    "component": "span",
+                                                    "text": f"更新 {updated}",
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                                {"component": "VDivider"},
+                                {
+                                    "component": "VCardText",
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": "d-flex align-center justify-space-between mb-1"
+                                            },
+                                            "content": [
+                                                {
+                                                    "component": "div",
+                                                    "props": {
+                                                        "class": "d-flex align-center"
+                                                    },
+                                                    "content": [
+                                                        {
+                                                            "component": "VIcon",
+                                                            "props": {
+                                                                "size": "small",
+                                                                "color": "success",
+                                                                "class": "mr-1",
+                                                            },
+                                                            "text": "mdi-percent-circle",
+                                                        },
+                                                        {
+                                                            "component": "span",
+                                                            "props": {
+                                                                "class": "text-subtitle-2"
+                                                            },
+                                                            "text": "整体完成度",
+                                                        },
+                                                    ],
+                                                },
+                                                {
+                                                    "component": "span",
+                                                    "props": {
+                                                        "class": "text-h6 font-weight-bold text-success"
+                                                    },
+                                                    "text": (
+                                                        f"{overall_val:.1f}%"
+                                                        if isinstance(
+                                                            overall_pct, (int, float)
+                                                        )
+                                                        else (progress.get("overall_text") or "—")
+                                                    ),
+                                                },
+                                            ],
+                                        },
+                                        {
+                                            "component": "VProgressLinear",
+                                            "props": {
+                                                "model-value": overall_val,
+                                                "color": "success"
+                                                if overall_val >= 100
+                                                else "primary",
+                                                "height": 10,
+                                                "rounded": True,
+                                                "class": "mb-4",
+                                            },
+                                        },
+                                        {
+                                            "component": "VRow",
+                                            "content": metric_cols,
+                                        },
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+
+    @staticmethod
+    def _progress_metric_col(
+        label: str, icon: str, color: str, item: Dict[str, Any], unit: str = ""
+    ) -> dict:
+        pct = item.get("pct")
+        pct_val = float(pct) if isinstance(pct, (int, float)) else 0.0
+        cur = item.get("cur")
+        target = item.get("target")
+        if cur is not None and target is not None:
+            cur_txt = f"{float(cur):.1f}"
+            tgt_txt = f"{float(target):g}"
+            value = f"{cur_txt}{unit} / {tgt_txt}{unit}"
+            pct_txt = f"{pct_val:.1f}%" if isinstance(pct, (int, float)) else "—"
+        else:
+            value = "—"
+            pct_txt = "—"
+        bar_color = "success" if pct_val >= 100 else color
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": 4},
+            "content": [
+                {
+                    "component": "VCard",
+                    "props": {"variant": "tonal", "color": color, "class": "mb-1"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "class": "d-flex align-center justify-space-between mb-1"
+                                    },
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "props": {"class": "d-flex align-center"},
+                                            "content": [
+                                                {
+                                                    "component": "VIcon",
+                                                    "props": {
+                                                        "size": "small",
+                                                        "class": "mr-1",
+                                                    },
+                                                    "text": icon,
+                                                },
+                                                {
+                                                    "component": "span",
+                                                    "props": {"class": "text-caption"},
+                                                    "text": label,
+                                                },
+                                            ],
+                                        },
+                                        {
+                                            "component": "span",
+                                            "props": {
+                                                "class": "text-caption font-weight-bold"
+                                            },
+                                            "text": pct_txt,
+                                        },
+                                    ],
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "class": "text-subtitle-1 font-weight-medium mb-2"
+                                    },
+                                    "text": value,
+                                },
+                                {
+                                    "component": "VProgressLinear",
+                                    "props": {
+                                        "model-value": pct_val,
+                                        "color": bar_color,
+                                        "height": 8,
+                                        "rounded": True,
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
             ],
         }
 
